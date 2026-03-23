@@ -1,0 +1,33 @@
+# Secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Database
+data/inmates.db
+
+# Debug screenshots & recon artifacts
+data/securus_debug/
+data/securus_recon/
+data/securus_recon2/
+data/securus_recon3/
+data/*.png
+data/*.json
+
+# Recon/debug scripts (not production)
+scrapers/ar_debug.py
+scrapers/ar_recon.py
+
+# Logs
+logs/
+
+# OS
+.DS_Store
+
+# Vendor data (large files)
+vendor extract 01/
+Texas_Department_of_Criminal_Justice_Releases_FY_2024.csv

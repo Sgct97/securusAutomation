@@ -1,0 +1,39 @@
+# Securus Inmate Outreach Automation
+# Python 3.11+ required
+
+# Browser Automation (Modern, Fast, Stealthy)
+playwright==1.49.1
+playwright-stealth==1.0.6
+
+# HTTP Client (Async, for simple scrapers)
+httpx==0.28.1
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# Database (Async SQLAlchemy 2.0)
+sqlalchemy[asyncio]==2.0.36
+aiosqlite==0.20.0
+asyncpg==0.30.0  # For PostgreSQL in production
+
+# Configuration & Validation
+pydantic==2.10.3
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
+
+# Task Queue & Scheduling
+redis==5.2.1
+rq==2.0.0
+apscheduler==3.10.4
+
+# API (for frontend communication)
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Logging & Monitoring
+structlog==24.4.0
+rich==13.9.4  # Pretty terminal output
+
+# Utilities
+tenacity==9.0.0  # Retry logic with exponential backoff
+fake-useragent==1.5.1  # User agent rotation
+
