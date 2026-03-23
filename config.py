@@ -44,6 +44,26 @@ class Settings(BaseSettings):
     )
     
     # =========================================================================
+    # PIPELINE SETTINGS (Linda: adjust these to change daily behavior)
+    # =========================================================================
+    daily_message_limit: int = Field(
+        default=25,
+        ge=0,
+        le=60,
+        description="Max outreach messages to send per day (set 0 to pause)"
+    )
+    scrape_interval_days: int = Field(
+        default=7,
+        ge=1,
+        le=30,
+        description="Days between scraper runs (1=daily, 7=weekly)"
+    )
+    states_to_scrape: str = Field(
+        default="WA,OK,NY,CA,AR",
+        description="Comma-separated list of states to scrape"
+    )
+    
+    # =========================================================================
     # RATE LIMITING
     # =========================================================================
     securus_action_delay: int = Field(
