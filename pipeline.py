@@ -50,6 +50,20 @@ STATE_TO_AGENCY = {
 
 MAX_RETRIES = 3
 
+PERMANENT_FAILURE_MARKERS = [
+    "contact not found on securus",
+    "emessaging not available",
+    "agency not in dropdown",
+    "no results found",
+    "service may not be available",
+]
+
+
+def _is_permanent_failure(error: str) -> bool:
+    """Errors that will never succeed on retry — don't waste time."""
+    err_lower = error.lower()
+    return any(marker in err_lower for marker in PERMANENT_FAILURE_MARKERS)
+
 
 # =========================================================================
 # STEP 1: SCRAPING
@@ -333,9 +347,16 @@ async def send_outreach(candidates: list[dict], send_target: int) -> dict:
                     if not contact_result.success:
                         err = contact_result.error or "Unknown error"
                         if "already" not in err.lower():
+                            permanent = _is_permanent_failure(err)
                             log.warning("Failed to add contact, trying next",
-                                        name=candidate["name"], error=err)
-                            await _mark_failed(candidate["outreach_id"], f"add_contact: {err}")
+                                        name=candidate["name"], error=err,
+                                        permanent=permanent)
+                            if permanent:
+                                await _mark_permanently_failed(
+                                    candidate["outreach_id"], f"add_contact: {err}")
+                            else:
+                                await _mark_failed(
+                                    candidate["outreach_id"], f"add_contact: {err}")
                             stats["contact_errors"] += 1
                             continue
                         log.info("Contact already exists, proceeding to message",
@@ -366,10 +387,16 @@ async def send_outreach(candidates: list[dict], send_target: int) -> dict:
                         await _mark_failed(candidate["outreach_id"], f"send: {err}")
                         stats["failed"] += 1
                         break
-                    await _mark_failed(candidate["outreach_id"], f"send: {err}")
+                    permanent = _is_permanent_failure(err)
+                    if permanent:
+                        await _mark_permanently_failed(
+                            candidate["outreach_id"], f"send: {err}")
+                    else:
+                        await _mark_failed(candidate["outreach_id"], f"send: {err}")
                     stats["failed"] += 1
                     log.warning("Failed to send, trying next",
-                                name=candidate["name"], error=err)
+                                name=candidate["name"], error=err,
+                                permanent=permanent)
 
             except Exception as e:
                 log.error("Unexpected error, trying next candidate",
@@ -429,6 +456,22 @@ async def _mark_failed(outreach_id: int, error: str):
             record.next_retry_at = datetime.now(timezone.utc) + timedelta(hours=6)
 
         await session.commit()
+
+
+async def _mark_permanently_failed(outreach_id: int, error: str):
+    """For errors that will never succeed on retry (inmate not on Securus, etc.)."""
+    async with async_session_factory() as session:
+        await session.execute(
+            update(OutreachRecord)
+            .where(OutreachRecord.id == outreach_id)
+            .values(
+                status=OutreachStatus.FAILED.value,
+                retry_count=MAX_RETRIES,
+                error_message=error,
+            )
+        )
+        await session.commit()
+    log.info("Permanently failed (will not retry)", outreach_id=outreach_id)
 
 
 # =========================================================================
