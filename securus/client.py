@@ -24,7 +24,12 @@ from playwright.async_api import (
     Playwright,
     TimeoutError as PwTimeout,
 )
-from playwright_stealth import Stealth
+try:
+    from playwright_stealth import Stealth
+    _USE_NEW_STEALTH = True
+except ImportError:
+    from playwright_stealth import stealth_async
+    _USE_NEW_STEALTH = False
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -125,9 +130,12 @@ class SecurusClient:
             locale="en-US",
             timezone_id="America/Chicago",
         )
-        stealth = Stealth()
         self._page = await self._context.new_page()
-        await stealth.apply_stealth_async(self._page)
+        if _USE_NEW_STEALTH:
+            stealth = Stealth()
+            await stealth.apply_stealth_async(self._page)
+        else:
+            await stealth_async(self._page)
         self._page.set_default_timeout(settings.browser_timeout)
         log.info("Browser started")
 
@@ -191,7 +199,7 @@ class SecurusClient:
         return str(path)
 
     async def _dismiss_overlays(self) -> None:
-        """Dismiss chat widgets, modals, and popups."""
+        """Dismiss chat widgets, modals, popups, and purge stale overlay divs."""
         for sel in [".popup-close-button", "button:has-text('×')"]:
             try:
                 btn = self.page.locator(sel).first
@@ -200,6 +208,12 @@ class SecurusClient:
                     await self.page.wait_for_timeout(300)
             except Exception:
                 pass
+
+        # Remove all .reveal-overlay divs from the DOM so they can't
+        # intercept pointer events or cause strict-mode violations
+        await self.page.evaluate(
+            "document.querySelectorAll('.reveal-overlay').forEach(el => el.remove())"
+        )
 
     async def _ensure_logged_in(self) -> None:
         """Re-login if session has expired."""
@@ -345,11 +359,10 @@ class SecurusClient:
 
             await self._human_delay()
 
-            # Select State — find the visible select with state options
+            # Select State — find the first visible "Select" dropdown
             selects = self.page.locator("select:visible")
             sel_count = await selects.count()
             state_select = None
-            agency_select = None
 
             for idx in range(sel_count):
                 sel = selects.nth(idx)
@@ -358,10 +371,8 @@ class SecurusClient:
                     continue
                 first_opt = await sel.evaluate("s => s.options[0]?.text || ''")
                 if first_opt == "Select":
-                    if state_select is None:
-                        state_select = sel
-                    else:
-                        agency_select = sel
+                    state_select = sel
+                    break
 
             if not state_select:
                 ss = await self._screenshot("no_state_dropdown")
@@ -376,7 +387,23 @@ class SecurusClient:
             log.info("State selected", state=state)
             await self.page.wait_for_timeout(2000)
 
-            # Select Agency/Facility if dropdown is present
+            # Re-discover agency dropdown AFTER state selection (it loads dynamically)
+            agency_select = None
+            selects = self.page.locator("select:visible")
+            sel_count = await selects.count()
+            for idx in range(sel_count):
+                sel = selects.nth(idx)
+                aria = await sel.get_attribute("aria-label") or ""
+                if "navigation" in aria.lower():
+                    continue
+                first_opt = await sel.evaluate("s => s.options[0]?.text || ''")
+                if first_opt == "Select":
+                    # Skip the state dropdown (already selected, won't show "Select")
+                    selected_val = await sel.evaluate("s => s.options[s.selectedIndex]?.text || ''")
+                    if selected_val == "Select":
+                        agency_select = sel
+                        break
+
             if agency_select:
                 try:
                     await agency_select.select_option(label=facility, timeout=5000)
@@ -385,11 +412,24 @@ class SecurusClient:
                     options = await agency_select.evaluate(
                         "sel => Array.from(sel.options).map(o => ({value: o.value, text: o.text}))"
                     )
+                    real_opts = [o for o in options if o["text"].strip().lower() != "select"]
+
                     matched = None
-                    for opt in options:
+                    # 1) Exact substring match
+                    for opt in real_opts:
                         if facility.lower() in opt["text"].lower():
                             matched = opt
                             break
+                    # 2) Reverse substring (dropdown text in our facility string)
+                    if not matched:
+                        for opt in real_opts:
+                            if opt["text"].lower() in facility.lower():
+                                matched = opt
+                                break
+                    # 3) If only one real option, use it
+                    if not matched and len(real_opts) == 1:
+                        matched = real_opts[0]
+
                     if matched:
                         await agency_select.select_option(value=matched["value"])
                         log.info("Matched agency", matched=matched["text"])
@@ -411,6 +451,24 @@ class SecurusClient:
             log.info("Search submitted")
             await self.page.wait_for_timeout(3000)
             await self._screenshot("search_results")
+
+            # Check for "CONTACT CANNOT BE FOUND" popup
+            not_found_popup = self.page.locator("text=CONTACT CANNOT BE FOUND")
+            try:
+                await not_found_popup.wait_for(state="visible", timeout=2000)
+                close_btn = self.page.locator("button:has-text('CLOSE'), a:has-text('CLOSE')").first
+                await close_btn.click()
+                await self.page.wait_for_timeout(1000)
+                ss = await self._screenshot("contact_not_found_popup")
+                return ContactResult(
+                    success=False, inmate_id=inmate_id or "",
+                    name=f"{first_name} {last_name}", state=state,
+                    facility=facility,
+                    error="Contact not found on Securus (service may not be available)",
+                    screenshot_path=ss,
+                )
+            except PwTimeout:
+                pass
 
             # Look for Add Contact button/link in the results
             add_btn = None
@@ -564,24 +622,17 @@ class SecurusClient:
 
             # Handle "DRAFT MESSAGE" modal + "DELETE CONFIRMATION" follow-up
             try:
-                overlay = self.page.locator(".reveal-overlay")
-                await overlay.wait_for(state="visible", timeout=3000)
-                log.info("Overlay popup detected")
-
                 ok_btn = self.page.locator(
-                    ".reveal-overlay button:has-text('OK'), "
-                    ".reveal-overlay a:has-text('OK'), "
-                    ".reveal button:has-text('OK'), "
-                    ".reveal a:has-text('OK')"
+                    "button:has-text('OK'):visible, a:has-text('OK'):visible"
                 ).first
+                await ok_btn.wait_for(state="visible", timeout=3000)
                 await ok_btn.click()
                 log.info("Dismissed draft popup (clicked OK)")
                 await self.page.wait_for_timeout(2000)
 
-                # DELETE CONFIRMATION popup follows
                 try:
                     delete_btn = self.page.locator(
-                        "button:has-text('DELETE')"
+                        "button:has-text('DELETE'):visible"
                     ).first
                     await delete_btn.wait_for(state="visible", timeout=3000)
                     await delete_btn.click()
@@ -592,6 +643,7 @@ class SecurusClient:
             except PwTimeout:
                 pass
 
+            # Purge any overlay divs left behind before interacting with the form
             await self._dismiss_overlays()
 
             # Select contact from dropdown
@@ -626,6 +678,25 @@ class SecurusClient:
                     )
 
             await self._human_delay()
+
+            # Check for "EMESSAGING NOT AVAILABLE" popup after contact selection
+            try:
+                not_avail = self.page.locator("text=NOT AVAILABLE").first
+                await not_avail.wait_for(state="visible", timeout=2000)
+                ok_btn = self.page.locator("button:has-text('OK'):visible").first
+                await ok_btn.click()
+                await self.page.wait_for_timeout(1000)
+                await self._dismiss_overlays()
+                ss = await self._screenshot("emessaging_not_available")
+                return MessageResult(
+                    success=False,
+                    contact_name=contact_name,
+                    subject=subject,
+                    error="eMessaging not available at this contact's location",
+                    screenshot_path=ss,
+                )
+            except PwTimeout:
+                pass
 
             # Fill subject — use type() to trigger Angular validation
             subject_input = self.page.locator("input#subject, input[name='subject']").first
@@ -699,11 +770,44 @@ class SecurusClient:
             except PwTimeout:
                 log.info("No stamp usage popup appeared, continuing")
 
-            # If we landed on the Inbox or Sent page, the message was sent
-            body_text = await self.page.locator("body").text_content() or ""
-            if "INBOX" in body_text or "Sent" in body_text:
-                await self._screenshot("message_sent")
-                log.info("Confirmed: page shows Inbox/Sent after send")
+            # Verify we actually left the Compose screen
+            await self.page.wait_for_timeout(2000)
+            current_url = self.page.url
+            page_text = await self.page.locator("body").text_content() or ""
+
+            # Success indicators: redirected to inbox/sent, or compose form is gone
+            compose_still_visible = False
+            try:
+                subj = self.page.locator("input#subject, input[name='subject']").first
+                compose_still_visible = await subj.is_visible(timeout=1000)
+            except Exception:
+                pass
+
+            has_error = False
+            for err_sel in [".error-message", ".alert-danger", "text=error"]:
+                try:
+                    err_el = self.page.locator(err_sel).first
+                    if await err_el.is_visible(timeout=500):
+                        has_error = True
+                        break
+                except Exception:
+                    pass
+
+            if compose_still_visible or has_error:
+                ss = await self._screenshot("send_failed_still_on_compose")
+                err_msg = "Message may not have sent — still on compose screen"
+                if has_error:
+                    err_msg = "Error detected after clicking send"
+                log.warning(err_msg, url=current_url)
+                return MessageResult(
+                    success=False,
+                    contact_name=contact_name,
+                    subject=subject,
+                    error=err_msg,
+                    screenshot_path=ss,
+                )
+
+            await self._screenshot("message_sent")
             self._messages_sent_this_hour += 1
             log.info("Message sent successfully",
                      contact=contact_name,

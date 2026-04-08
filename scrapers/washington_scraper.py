@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Optional
 
 from playwright.async_api import async_playwright, Page, TimeoutError as PwTimeout
-from playwright_stealth import Stealth
+try:
+    from playwright_stealth import Stealth
+    _USE_NEW_STEALTH = True
+except ImportError:
+    from playwright_stealth import stealth_async
+    _USE_NEW_STEALTH = False
 from sqlalchemy import select, func
 
 import sys
@@ -216,9 +221,12 @@ async def run(max_pages: Optional[int] = None, start_page: int = 1):
                 "Chrome/131.0.0.0 Safari/537.36"
             ),
         )
-        stealth = Stealth()
         page = await context.new_page()
-        await stealth.apply_stealth_async(page)
+        if _USE_NEW_STEALTH:
+            stealth = Stealth()
+            await stealth.apply_stealth_async(page)
+        else:
+            await stealth_async(page)
         page.set_default_timeout(15000)
 
         end_page = start_page + (max_pages or 9999) - 1

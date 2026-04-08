@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 import structlog
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, or_
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -43,9 +43,9 @@ STATE_ABBR_TO_FULL = {
 STATE_TO_AGENCY = {
     "WA": "Washington State Department of Corrections",
     "OK": "Oklahoma Department of Corrections",
-    "NY": "New York State Department of Corrections and Community Supervision",
-    "CA": "California Department of Corrections and Rehabilitation",
-    "AR": "Arkansas Department of Corrections",
+    "NY": "NYS DOCCS Inmate Services",
+    "CA": "California Department of Corrections & Rehabilitation",
+    "AR": "Arkansas DOC",
 }
 
 MAX_RETRIES = 3
@@ -187,14 +187,18 @@ async def create_outreach_for_new_inmates() -> int:
 # STEP 3: GET PENDING CANDIDATES (distributed across states)
 # =========================================================================
 
+CANDIDATE_POOL_MULTIPLIER = 10
+
 async def get_pending_candidates(limit: int) -> list[dict]:
     """
-    Pull pending outreach candidates, distributed evenly across states.
-    Skips inmates that have exceeded MAX_RETRIES.
+    Pull a large pool of pending outreach candidates, distributed evenly
+    across states. The pool is CANDIDATE_POOL_MULTIPLIER * limit so the
+    send loop has plenty of fallbacks when individual inmates fail.
     """
     states = [s.strip() for s in settings.states_to_scrape.split(",") if s.strip()]
-    per_state = max(1, limit // len(states))
-    remainder = limit - (per_state * len(states))
+    pool_size = limit * CANDIDATE_POOL_MULTIPLIER
+    per_state = max(1, pool_size // len(states))
+    remainder = pool_size - (per_state * len(states))
 
     candidates = []
 
@@ -207,9 +211,16 @@ async def get_pending_candidates(limit: int) -> list[dict]:
                 .join(Inmate)
                 .where(
                     Inmate.state == state,
-                    OutreachRecord.status == OutreachStatus.PENDING.value,
+                    OutreachRecord.status.in_([
+                        OutreachStatus.PENDING.value,
+                        OutreachStatus.CONTACT_ADDED.value,
+                    ]),
                     OutreachRecord.retry_count < MAX_RETRIES,
                     ~Inmate.name.like("UNKNOWN%"),
+                    or_(
+                        OutreachRecord.next_retry_at == None,
+                        OutreachRecord.next_retry_at <= datetime.now(timezone.utc),
+                    ),
                 )
                 .order_by(Inmate.discovered_at.desc())
                 .limit(state_limit)
@@ -227,6 +238,7 @@ async def get_pending_candidates(limit: int) -> list[dict]:
 
                 candidates.append({
                     "outreach_id": record.id,
+                    "outreach_status": record.status,
                     "inmate_db_id": inmate.id,
                     "inmate_id": inmate.inmate_id,
                     "name": inmate.name,
@@ -238,8 +250,8 @@ async def get_pending_candidates(limit: int) -> list[dict]:
                     "agency": STATE_TO_AGENCY.get(inmate.state, ""),
                 })
 
-    log.info("Pending candidates loaded",
-             total=len(candidates),
+    log.info("Candidate pool loaded",
+             pool_size=len(candidates), send_target=limit,
              by_state={s: sum(1 for c in candidates if c["state"] == s) for s in states})
     return candidates
 
@@ -248,10 +260,16 @@ async def get_pending_candidates(limit: int) -> list[dict]:
 # STEP 4: SEND MESSAGES
 # =========================================================================
 
-async def send_outreach(candidates: list[dict]) -> dict:
+async def send_outreach(candidates: list[dict], send_target: int) -> dict:
     """
-    Log into Securus once and process all candidates.
-    Returns summary stats.
+    Log into Securus once, iterate through the candidate pool, and keep
+    trying until we've successfully sent `send_target` messages or
+    exhausted all candidates. Individual failures (contact not found,
+    agency mismatch, etc.) just skip to the next candidate.
+
+    Only stops early for:
+      - Out of stamps (can't send anything else)
+      - Login failure
     """
     stats = {"sent": 0, "failed": 0, "skipped": 0, "contact_errors": 0}
 
@@ -269,38 +287,62 @@ async def send_outreach(candidates: list[dict]) -> dict:
             log.error("Securus login failed, aborting run", error=str(e))
             return stats
 
-        log.info("Login successful, processing candidates", count=len(candidates))
+        log.info("Login successful",
+                 pool_size=len(candidates), send_target=send_target)
 
         for i, candidate in enumerate(candidates, 1):
-            log.info(f"Processing {i}/{len(candidates)}",
+            if stats["sent"] >= send_target:
+                log.info("Daily send target reached",
+                         sent=stats["sent"], target=send_target)
+                break
+
+            log.info(f"Processing {i}/{len(candidates)} "
+                     f"(sent {stats['sent']}/{send_target})",
                      name=candidate["name"],
                      state=candidate["state"],
                      inmate_id=candidate["inmate_id"])
 
             try:
-                # Add contact
-                contact_result = await client.add_contact(
-                    first_name=candidate["first_name"],
-                    last_name=candidate["last_name"],
-                    state=candidate["state_full"],
-                    facility=candidate["agency"],
-                    inmate_id=candidate["inmate_id"],
-                )
-
-                if not contact_result.success:
-                    err = contact_result.error or "Unknown error"
-                    # "already" in the error typically means contact exists
-                    if "already" not in err.lower():
-                        log.warning("Failed to add contact",
-                                    name=candidate["name"], error=err)
-                        await _mark_failed(candidate["outreach_id"], f"add_contact: {err}")
-                        stats["contact_errors"] += 1
+                # Re-check record status from DB (guards against duplicate sends
+                # if pipeline ran twice or DB was copied mid-run)
+                async with async_session_factory() as session:
+                    fresh = (await session.execute(
+                        select(OutreachRecord).where(
+                            OutreachRecord.id == candidate["outreach_id"]
+                        )
+                    )).scalar_one_or_none()
+                    if fresh and fresh.status == OutreachStatus.MESSAGE_SENT.value:
+                        log.info("Already sent (detected on re-check), skipping",
+                                 name=candidate["name"])
+                        stats["skipped"] += 1
                         continue
-                    log.info("Contact already exists, proceeding to message",
+
+                # Add contact (skip if already added on a prior run)
+                if candidate["outreach_status"] == OutreachStatus.CONTACT_ADDED.value:
+                    log.info("Contact already added (prior run), skipping to message",
                              name=candidate["name"])
                 else:
-                    await _mark_contact_added(candidate["outreach_id"])
-                    log.info("Contact added", name=candidate["name"])
+                    contact_result = await client.add_contact(
+                        first_name=candidate["first_name"],
+                        last_name=candidate["last_name"],
+                        state=candidate["state_full"],
+                        facility=candidate["agency"],
+                        inmate_id=candidate["inmate_id"],
+                    )
+
+                    if not contact_result.success:
+                        err = contact_result.error or "Unknown error"
+                        if "already" not in err.lower():
+                            log.warning("Failed to add contact, trying next",
+                                        name=candidate["name"], error=err)
+                            await _mark_failed(candidate["outreach_id"], f"add_contact: {err}")
+                            stats["contact_errors"] += 1
+                            continue
+                        log.info("Contact already exists, proceeding to message",
+                                 name=candidate["name"])
+                    else:
+                        await _mark_contact_added(candidate["outreach_id"])
+                        log.info("Contact added", name=candidate["name"])
 
                 # Send message
                 contact_name = f"{candidate['first_name']} {candidate['last_name']}".upper()
@@ -314,21 +356,23 @@ async def send_outreach(candidates: list[dict]) -> dict:
                     await _mark_sent(candidate["outreach_id"])
                     stats["sent"] += 1
                     log.info("Message sent",
-                             name=candidate["name"], sent=stats["sent"])
+                             name=candidate["name"],
+                             sent=stats["sent"],
+                             target=send_target)
                 else:
                     err = msg_result.error or "Unknown error"
-                    # Out of stamps — stop the entire run
                     if "stamp" in err.lower() and ("0" in err or "no" in err.lower()):
-                        log.warning("Out of stamps, stopping", error=err)
+                        log.warning("Out of stamps, stopping run", error=err)
                         await _mark_failed(candidate["outreach_id"], f"send: {err}")
                         stats["failed"] += 1
                         break
                     await _mark_failed(candidate["outreach_id"], f"send: {err}")
                     stats["failed"] += 1
-                    log.warning("Failed to send", name=candidate["name"], error=err)
+                    log.warning("Failed to send, trying next",
+                                name=candidate["name"], error=err)
 
             except Exception as e:
-                log.error("Unexpected error processing candidate",
+                log.error("Unexpected error, trying next candidate",
                           name=candidate["name"], error=str(e))
                 await _mark_failed(candidate["outreach_id"], str(e))
                 stats["failed"] += 1
@@ -381,6 +425,7 @@ async def _mark_failed(outreach_id: int, error: str):
             log.warning("Max retries exceeded, marking as failed",
                         outreach_id=outreach_id)
         else:
+            record.status = OutreachStatus.PENDING.value
             record.next_retry_at = datetime.now(timezone.utc) + timedelta(hours=6)
 
         await session.commit()
@@ -424,8 +469,8 @@ async def run_pipeline():
         log.info("Pipeline complete", elapsed=str(datetime.now(timezone.utc) - run_start))
         return
 
-    # Step 4: Send messages
-    stats = await send_outreach(candidates)
+    # Step 4: Send messages (keep trying until we hit the daily limit)
+    stats = await send_outreach(candidates, send_target=settings.daily_message_limit)
 
     # Summary
     elapsed = datetime.now(timezone.utc) - run_start

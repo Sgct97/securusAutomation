@@ -3,7 +3,7 @@
 
 # Browser Automation (Modern, Fast, Stealthy)
 playwright==1.49.1
-playwright-stealth==1.0.6
+playwright-stealth>=2.0.0
 
 # HTTP Client (Async, for simple scrapers)
 httpx==0.28.1
