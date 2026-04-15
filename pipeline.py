@@ -24,10 +24,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import settings
 from database import (
-    Inmate, OutreachRecord, OutreachStatus, ScrapeProgress,
+    Inmate, OutreachRecord, OutreachStatus, ScrapeProgress, StampPurchase,
     async_session_factory, engine, Base,
 )
-from securus.client import SecurusClient
+from securus.client import SecurusClient, STAMP_PACKAGES
 from securus.message_template import SUBJECT, BODY
 
 log = structlog.get_logger()
@@ -271,19 +271,112 @@ async def get_pending_candidates(limit: int) -> list[dict]:
 
 
 # =========================================================================
+# STEP 3.5: ENSURE STAMPS
+# =========================================================================
+
+async def ensure_stamps(client: SecurusClient, candidates: list[dict]) -> dict:
+    """
+    Check per-state stamp balances and buy packages for any state
+    running low. Respects daily_stamp_purchase_limit and stamp_auto_buy.
+    """
+    stats = {"checked": 0, "purchased": 0, "total_stamps_bought": 0, "errors": []}
+
+    state_counts: dict[str, int] = {}
+    for c in candidates:
+        state_counts[c["state"]] = state_counts.get(c["state"], 0) + 1
+
+    send_target = settings.daily_message_limit
+    total_candidates = sum(state_counts.values())
+    state_needed: dict[str, int] = {}
+    for st, count in state_counts.items():
+        proportion = count / total_candidates if total_candidates > 0 else 0
+        state_needed[st] = max(1, round(proportion * send_target))
+
+    log.info("Stamp needs by state", needed=state_needed)
+
+    balances = await client.get_stamp_balances()
+    log.info("Current stamp balances", balances=balances)
+    stats["checked"] = len(balances)
+
+    total_purchased_today = 0
+    buffer = settings.stamp_buffer_per_state
+
+    for state, needed in state_needed.items():
+        current = balances.get(state, 0)
+        deficit = (needed + buffer) - current
+
+        if deficit <= 0:
+            log.info("Stamps sufficient", state=state,
+                     current=current, needed=needed)
+            continue
+
+        if total_purchased_today + deficit > settings.daily_stamp_purchase_limit:
+            remaining = settings.daily_stamp_purchase_limit - total_purchased_today
+            if remaining <= 0:
+                log.warning("Daily stamp purchase limit reached",
+                            limit=settings.daily_stamp_purchase_limit)
+                break
+            deficit = remaining
+
+        package = SecurusClient._pick_package(deficit)
+
+        if not settings.stamp_auto_buy:
+            log.info("DRY RUN: Would purchase stamps",
+                     state=state, package_size=package["size"],
+                     cost=package["cost"], deficit=deficit,
+                     current=current, needed=needed)
+            continue
+
+        agency = STATE_TO_AGENCY.get(state, "")
+        result = await client.purchase_stamps(
+            state=state, package_size=package["size"], agency_name=agency,
+        )
+
+        if result.success:
+            total_purchased_today += package["size"]
+            stats["purchased"] += 1
+            stats["total_stamps_bought"] += package["size"]
+            await _log_stamp_purchase(
+                state, package["size"], package["cost"], True)
+        else:
+            err = result.error or "Unknown error"
+            stats["errors"].append(f"{state}: {err}")
+            await _log_stamp_purchase(
+                state, package["size"], package["cost"], False, err)
+            log.warning("Stamp purchase failed",
+                        state=state, error=err)
+
+    log.info("Stamp check complete", **stats)
+    return stats
+
+
+async def _log_stamp_purchase(
+    state: str, package_size: int, cost_usd: float,
+    success: bool, error: str | None = None,
+):
+    async with async_session_factory() as session:
+        session.add(StampPurchase(
+            state=state,
+            package_size=package_size,
+            cost_usd=cost_usd,
+            success=success,
+            error_message=error,
+        ))
+        await session.commit()
+
+
+# =========================================================================
 # STEP 4: SEND MESSAGES
 # =========================================================================
 
-async def send_outreach(candidates: list[dict], send_target: int) -> dict:
+async def send_outreach(
+    client: SecurusClient, candidates: list[dict], send_target: int
+) -> dict:
     """
-    Log into Securus once, iterate through the candidate pool, and keep
-    trying until we've successfully sent `send_target` messages or
-    exhausted all candidates. Individual failures (contact not found,
-    agency mismatch, etc.) just skip to the next candidate.
-
-    Only stops early for:
-      - Out of stamps (can't send anything else)
-      - Login failure
+    Iterate through the candidate pool using an already-authenticated
+    client, sending messages until `send_target` is reached or all
+    candidates are exhausted. Individual failures skip to the next
+    candidate. Stops early only if stamps run out.
     """
     stats = {"sent": 0, "failed": 0, "skipped": 0, "contact_errors": 0}
 
@@ -291,118 +384,104 @@ async def send_outreach(candidates: list[dict], send_target: int) -> dict:
         log.info("No candidates to process")
         return stats
 
-    async with SecurusClient(headless=settings.headless) as client:
-        client._last_action_time = 0
+    log.info("Starting outreach",
+             pool_size=len(candidates), send_target=send_target)
 
-        log.info("Logging into Securus")
+    for i, candidate in enumerate(candidates, 1):
+        if stats["sent"] >= send_target:
+            log.info("Daily send target reached",
+                     sent=stats["sent"], target=send_target)
+            break
+
+        log.info(f"Processing {i}/{len(candidates)} "
+                 f"(sent {stats['sent']}/{send_target})",
+                 name=candidate["name"],
+                 state=candidate["state"],
+                 inmate_id=candidate["inmate_id"])
+
         try:
-            await client.login()
-        except Exception as e:
-            log.error("Securus login failed, aborting run", error=str(e))
-            return stats
-
-        log.info("Login successful",
-                 pool_size=len(candidates), send_target=send_target)
-
-        for i, candidate in enumerate(candidates, 1):
-            if stats["sent"] >= send_target:
-                log.info("Daily send target reached",
-                         sent=stats["sent"], target=send_target)
-                break
-
-            log.info(f"Processing {i}/{len(candidates)} "
-                     f"(sent {stats['sent']}/{send_target})",
-                     name=candidate["name"],
-                     state=candidate["state"],
-                     inmate_id=candidate["inmate_id"])
-
-            try:
-                # Re-check record status from DB (guards against duplicate sends
-                # if pipeline ran twice or DB was copied mid-run)
-                async with async_session_factory() as session:
-                    fresh = (await session.execute(
-                        select(OutreachRecord).where(
-                            OutreachRecord.id == candidate["outreach_id"]
-                        )
-                    )).scalar_one_or_none()
-                    if fresh and fresh.status == OutreachStatus.MESSAGE_SENT.value:
-                        log.info("Already sent (detected on re-check), skipping",
-                                 name=candidate["name"])
-                        stats["skipped"] += 1
-                        continue
-
-                # Add contact (skip if already added on a prior run)
-                if candidate["outreach_status"] == OutreachStatus.CONTACT_ADDED.value:
-                    log.info("Contact already added (prior run), skipping to message",
-                             name=candidate["name"])
-                else:
-                    contact_result = await client.add_contact(
-                        first_name=candidate["first_name"],
-                        last_name=candidate["last_name"],
-                        state=candidate["state_full"],
-                        facility=candidate["agency"],
-                        inmate_id=candidate["inmate_id"],
+            async with async_session_factory() as session:
+                fresh = (await session.execute(
+                    select(OutreachRecord).where(
+                        OutreachRecord.id == candidate["outreach_id"]
                     )
+                )).scalar_one_or_none()
+                if fresh and fresh.status == OutreachStatus.MESSAGE_SENT.value:
+                    log.info("Already sent (detected on re-check), skipping",
+                             name=candidate["name"])
+                    stats["skipped"] += 1
+                    continue
 
-                    if not contact_result.success:
-                        err = contact_result.error or "Unknown error"
-                        if "already" not in err.lower():
-                            permanent = _is_permanent_failure(err)
-                            log.warning("Failed to add contact, trying next",
-                                        name=candidate["name"], error=err,
-                                        permanent=permanent)
-                            if permanent:
-                                await _mark_permanently_failed(
-                                    candidate["outreach_id"], f"add_contact: {err}")
-                            else:
-                                await _mark_failed(
-                                    candidate["outreach_id"], f"add_contact: {err}")
-                            stats["contact_errors"] += 1
-                            continue
-                        log.info("Contact already exists, proceeding to message",
-                                 name=candidate["name"])
-                    else:
-                        await _mark_contact_added(candidate["outreach_id"])
-                        log.info("Contact added", name=candidate["name"])
-
-                # Send message
-                contact_name = f"{candidate['first_name']} {candidate['last_name']}".upper()
-                msg_result = await client.send_message(
-                    contact_name=contact_name,
-                    subject=SUBJECT,
-                    body=BODY,
+            if candidate["outreach_status"] == OutreachStatus.CONTACT_ADDED.value:
+                log.info("Contact already added (prior run), skipping to message",
+                         name=candidate["name"])
+            else:
+                contact_result = await client.add_contact(
+                    first_name=candidate["first_name"],
+                    last_name=candidate["last_name"],
+                    state=candidate["state_full"],
+                    facility=candidate["agency"],
+                    inmate_id=candidate["inmate_id"],
                 )
 
-                if msg_result.success:
-                    await _mark_sent(candidate["outreach_id"])
-                    stats["sent"] += 1
-                    log.info("Message sent",
-                             name=candidate["name"],
-                             sent=stats["sent"],
-                             target=send_target)
+                if not contact_result.success:
+                    err = contact_result.error or "Unknown error"
+                    if "already" not in err.lower():
+                        permanent = _is_permanent_failure(err)
+                        log.warning("Failed to add contact, trying next",
+                                    name=candidate["name"], error=err,
+                                    permanent=permanent)
+                        if permanent:
+                            await _mark_permanently_failed(
+                                candidate["outreach_id"], f"add_contact: {err}")
+                        else:
+                            await _mark_failed(
+                                candidate["outreach_id"], f"add_contact: {err}")
+                        stats["contact_errors"] += 1
+                        continue
+                    log.info("Contact already exists, proceeding to message",
+                             name=candidate["name"])
                 else:
-                    err = msg_result.error or "Unknown error"
-                    if "stamp" in err.lower() and ("0" in err or "no" in err.lower()):
-                        log.warning("Out of stamps, stopping run", error=err)
-                        await _mark_failed(candidate["outreach_id"], f"send: {err}")
-                        stats["failed"] += 1
-                        break
-                    permanent = _is_permanent_failure(err)
-                    if permanent:
-                        await _mark_permanently_failed(
-                            candidate["outreach_id"], f"send: {err}")
-                    else:
-                        await _mark_failed(candidate["outreach_id"], f"send: {err}")
-                    stats["failed"] += 1
-                    log.warning("Failed to send, trying next",
-                                name=candidate["name"], error=err,
-                                permanent=permanent)
+                    await _mark_contact_added(candidate["outreach_id"])
+                    log.info("Contact added", name=candidate["name"])
 
-            except Exception as e:
-                log.error("Unexpected error, trying next candidate",
-                          name=candidate["name"], error=str(e))
-                await _mark_failed(candidate["outreach_id"], str(e))
+            contact_name = f"{candidate['first_name']} {candidate['last_name']}".upper()
+            msg_result = await client.send_message(
+                contact_name=contact_name,
+                subject=SUBJECT,
+                body=BODY,
+            )
+
+            if msg_result.success:
+                await _mark_sent(candidate["outreach_id"])
+                stats["sent"] += 1
+                log.info("Message sent",
+                         name=candidate["name"],
+                         sent=stats["sent"],
+                         target=send_target)
+            else:
+                err = msg_result.error or "Unknown error"
+                if "stamp" in err.lower() and ("0" in err or "no" in err.lower()):
+                    log.warning("Out of stamps, stopping run", error=err)
+                    await _mark_failed(candidate["outreach_id"], f"send: {err}")
+                    stats["failed"] += 1
+                    break
+                permanent = _is_permanent_failure(err)
+                if permanent:
+                    await _mark_permanently_failed(
+                        candidate["outreach_id"], f"send: {err}")
+                else:
+                    await _mark_failed(candidate["outreach_id"], f"send: {err}")
                 stats["failed"] += 1
+                log.warning("Failed to send, trying next",
+                            name=candidate["name"], error=err,
+                            permanent=permanent)
+
+        except Exception as e:
+            log.error("Unexpected error, trying next candidate",
+                      name=candidate["name"], error=str(e))
+            await _mark_failed(candidate["outreach_id"], str(e))
+            stats["failed"] += 1
 
     return stats
 
@@ -512,8 +591,26 @@ async def run_pipeline():
         log.info("Pipeline complete", elapsed=str(datetime.now(timezone.utc) - run_start))
         return
 
-    # Step 4: Send messages (keep trying until we hit the daily limit)
-    stats = await send_outreach(candidates, send_target=settings.daily_message_limit)
+    # Steps 3.5 & 4: Login once, ensure stamps, then send messages
+    async with SecurusClient(headless=settings.headless) as client:
+        client._last_action_time = 0
+
+        log.info("Logging into Securus")
+        try:
+            await client.login()
+        except Exception as e:
+            log.error("Securus login failed, aborting run", error=str(e))
+            return
+
+        log.info("Login successful")
+
+        # Step 3.5: Check and buy stamps if needed
+        stamp_stats = await ensure_stamps(client, candidates)
+
+        # Step 4: Send messages
+        stats = await send_outreach(
+            client, candidates, send_target=settings.daily_message_limit,
+        )
 
     # Summary
     elapsed = datetime.now(timezone.utc) - run_start
@@ -522,6 +619,7 @@ async def run_pipeline():
              sent=stats["sent"],
              failed=stats["failed"],
              contact_errors=stats["contact_errors"],
+             stamps_bought=stamp_stats.get("total_stamps_bought", 0),
              elapsed=str(elapsed))
     log.info("=" * 60)
 

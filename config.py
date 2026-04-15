@@ -64,6 +64,26 @@ class Settings(BaseSettings):
     )
     
     # =========================================================================
+    # STAMP BUYING (Linda: adjust these to manage stamp purchasing)
+    # =========================================================================
+    stamp_auto_buy: bool = Field(
+        default=False,
+        description="Enable automatic stamp purchasing (set True after dry-run testing)"
+    )
+    stamp_buffer_per_state: int = Field(
+        default=5,
+        ge=0,
+        le=30,
+        description="Extra stamps to keep per state above planned sends"
+    )
+    daily_stamp_purchase_limit: int = Field(
+        default=60,
+        ge=0,
+        le=120,
+        description="Max stamps to purchase in a single day (Securus limit)"
+    )
+    
+    # =========================================================================
     # RATE LIMITING
     # =========================================================================
     securus_action_delay: int = Field(

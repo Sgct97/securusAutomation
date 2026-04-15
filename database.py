@@ -8,7 +8,7 @@ from typing import Optional, AsyncGenerator
 from enum import Enum
 
 from sqlalchemy import (
-    String, Integer, DateTime, Boolean, Text, ForeignKey,
+    String, Integer, Float, DateTime, Boolean, Text, ForeignKey,
     Index, UniqueConstraint, func
 )
 from sqlalchemy.orm import (
@@ -245,6 +245,27 @@ class ActionLog(Base):
     
     def __repr__(self) -> str:
         return f"<ActionLog {self.action_type}: {self.status} @ {self.timestamp}>"
+
+
+class StampPurchase(Base):
+    """Audit trail for automated stamp purchases."""
+    __tablename__ = "stamp_purchases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    state: Mapped[str] = mapped_column(String(2), nullable=False, index=True)
+    package_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    purchased_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=func.now(),
+        nullable=False,
+        index=True,
+    )
+
+    def __repr__(self) -> str:
+        return f"<StampPurchase {self.state} {self.package_size}pk {'OK' if self.success else 'FAIL'}>"
 
 
 # =============================================================================

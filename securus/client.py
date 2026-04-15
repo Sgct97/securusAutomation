@@ -10,6 +10,7 @@ Handles:
 
 import asyncio
 import random
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -68,6 +69,33 @@ class MessageResult:
     subject: str
     error: Optional[str] = None
     screenshot_path: Optional[str] = None
+
+
+@dataclass
+class StampPurchaseResult:
+    """Result of a stamp purchase attempt."""
+    success: bool
+    state: str
+    package_size: int
+    cost_usd: float
+    error: Optional[str] = None
+    screenshot_path: Optional[str] = None
+
+
+STAMP_PACKAGES = [
+    {"size": 6, "cost": 2.00},
+    {"size": 20, "cost": 5.00},
+    {"size": 35, "cost": 7.50},
+    {"size": 60, "cost": 10.00},
+]
+
+AGENCY_TO_STATE = {
+    "washington state department of corrections": "WA",
+    "oklahoma department of corrections": "OK",
+    "nys doccs inmate services": "NY",
+    "california department of corrections & rehabilitation": "CA",
+    "arkansas doc": "AR",
+}
 
 
 class SecurusClient:
@@ -906,3 +934,339 @@ class SecurusClient:
         contacts = [o for o in options if o["value"]]
         log.info("Compose contacts retrieved", count=len(contacts))
         return contacts
+
+    # =========================================================================
+    # STAMP PURCHASING
+    # =========================================================================
+
+    @staticmethod
+    def _pick_package(deficit: int) -> dict:
+        """Return the smallest stamp package that covers the deficit."""
+        for pkg in STAMP_PACKAGES:
+            if pkg["size"] >= deficit:
+                return pkg
+        return STAMP_PACKAGES[-1]
+
+    async def _navigate_to_purchase_stamps(self) -> bool:
+        """Navigate to the Purchase Stamps page via my-account. Returns True on success."""
+        await self._ensure_logged_in()
+        await self.page.goto(self.MY_ACCOUNT_URL, wait_until="domcontentloaded")
+        await self.page.wait_for_timeout(3000)
+        await self._dismiss_overlays()
+
+        purchase_link = self.page.locator("a:has-text('Purchase Stamps')").first
+        try:
+            await purchase_link.wait_for(state="visible", timeout=10000)
+            await purchase_link.click()
+            await self.page.wait_for_timeout(3000)
+            await self._dismiss_overlays()
+            log.info("Navigated to Purchase Stamps page")
+            return True
+        except PwTimeout:
+            ss = await self._screenshot("purchase_stamps_link_not_found")
+            log.error("Purchase Stamps link not found on my-account page",
+                      screenshot=ss)
+            return False
+
+    async def get_stamp_balances(self) -> dict[str, int]:
+        """
+        Read per-state stamp balances from the Purchase Stamps dropdown.
+
+        Parses optgroup labels or option text matching the pattern
+        "<Agency Name>: <N> Stamps Available" and maps agency names
+        to state abbreviations.
+        """
+        await self._rate_limit()
+
+        if not await self._navigate_to_purchase_stamps():
+            return {}
+
+        await self._screenshot("stamp_balances_page")
+
+        balances: dict[str, int] = {}
+
+        # Extract dropdown structure: try optgroups first, fall back to options
+        dropdown_data = await self.page.evaluate("""
+            () => {
+                const sel = document.querySelector('select');
+                if (!sel) return null;
+
+                const groups = [];
+                const optgroups = sel.querySelectorAll('optgroup');
+                optgroups.forEach(g => {
+                    groups.push({
+                        label: g.label || '',
+                        options: Array.from(g.options).map(o => ({
+                            value: o.value, text: o.text
+                        }))
+                    });
+                });
+
+                const allOptions = Array.from(sel.options).map(o => ({
+                    value: o.value, text: o.text
+                }));
+
+                return { optgroups: groups, options: allOptions };
+            }
+        """)
+
+        if not dropdown_data:
+            log.warning("No dropdown found on Purchase Stamps page")
+            return balances
+
+        stamp_pattern = re.compile(r"(\d+)\s+Stamps?\s+Available", re.IGNORECASE)
+
+        # Parse optgroup labels (preferred)
+        if dropdown_data.get("optgroups"):
+            for group in dropdown_data["optgroups"]:
+                label = group.get("label", "")
+                match = stamp_pattern.search(label)
+                if match:
+                    count = int(match.group(1))
+                    label_lower = label.lower()
+                    for agency, state in AGENCY_TO_STATE.items():
+                        if agency in label_lower:
+                            balances[state] = balances.get(state, 0) + count
+                            break
+
+        # Fall back to option text if no optgroups found
+        if not balances and dropdown_data.get("options"):
+            for opt in dropdown_data["options"]:
+                text = opt.get("text", "")
+                match = stamp_pattern.search(text)
+                if match:
+                    count = int(match.group(1))
+                    text_lower = text.lower()
+                    for agency, state in AGENCY_TO_STATE.items():
+                        if agency in text_lower:
+                            balances[state] = balances.get(state, 0) + count
+                            break
+
+        log.info("Stamp balances parsed", balances=balances)
+        return balances
+
+    async def purchase_stamps(
+        self,
+        state: str,
+        package_size: int,
+        agency_name: str,
+    ) -> StampPurchaseResult:
+        """
+        Buy a stamp package for a given state.
+
+        Navigates to Purchase Stamps, selects a contact from the target
+        state's facility, picks the package, and completes checkout.
+        Retries up to 3 times if clicking "Next" causes a logout.
+        """
+        pkg = next((p for p in STAMP_PACKAGES if p["size"] == package_size), None)
+        if not pkg:
+            return StampPurchaseResult(
+                success=False, state=state, package_size=package_size,
+                cost_usd=0, error=f"Invalid package size: {package_size}",
+            )
+
+        MAX_PURCHASE_ATTEMPTS = 3
+
+        for attempt in range(1, MAX_PURCHASE_ATTEMPTS + 1):
+            log.info("Attempting stamp purchase",
+                     state=state, package=package_size, attempt=attempt)
+
+            try:
+                await self._ensure_logged_in()
+                await self._rate_limit()
+
+                if not await self._navigate_to_purchase_stamps():
+                    return StampPurchaseResult(
+                        success=False, state=state, package_size=package_size,
+                        cost_usd=0,
+                        error="Could not navigate to Purchase Stamps page",
+                    )
+
+                # ── Select a contact from the target state ──
+                contact_dropdown = self.page.locator("select").first
+                await contact_dropdown.wait_for(state="visible", timeout=10000)
+
+                # Find an option belonging to the target state's agency
+                dropdown_info = await contact_dropdown.evaluate("""
+                    (sel) => {
+                        const result = [];
+                        const groups = sel.querySelectorAll('optgroup');
+                        if (groups.length > 0) {
+                            groups.forEach(g => {
+                                g.querySelectorAll('option').forEach(o => {
+                                    result.push({
+                                        value: o.value, text: o.text,
+                                        group: g.label || ''
+                                    });
+                                });
+                            });
+                        } else {
+                            sel.querySelectorAll('option').forEach(o => {
+                                result.push({
+                                    value: o.value, text: o.text, group: ''
+                                });
+                            });
+                        }
+                        return result;
+                    }
+                """)
+
+                target_option = None
+                agency_lower = agency_name.lower()
+                for opt in dropdown_info:
+                    if not opt["value"]:
+                        continue
+                    group_lower = opt.get("group", "").lower()
+                    text_lower = opt.get("text", "").lower()
+                    if agency_lower in group_lower or agency_lower in text_lower:
+                        target_option = opt
+                        break
+
+                if not target_option:
+                    available = [f"{o['group']} / {o['text']}" for o in dropdown_info
+                                 if o["value"]][:10]
+                    ss = await self._screenshot("stamp_no_contact_for_state")
+                    return StampPurchaseResult(
+                        success=False, state=state, package_size=package_size,
+                        cost_usd=0,
+                        error=f"No contact found for {agency_name}. "
+                              f"Available: {available}",
+                        screenshot_path=ss,
+                    )
+
+                await contact_dropdown.select_option(value=target_option["value"])
+                log.info("Selected contact for stamp purchase",
+                         contact=target_option["text"], state=state)
+                await self.page.wait_for_timeout(2000)
+
+                # ── Select the stamp package ──
+                await self._screenshot("stamp_packages_visible")
+
+                # Find the radio/checkbox for the target package by matching
+                # text like "6 Stamps Package" or "60 Stamps Package"
+                pkg_label = f"{package_size} Stamps Package"
+                pkg_locator = self.page.locator(f"text='{pkg_label}'").first
+                try:
+                    await pkg_locator.wait_for(state="visible", timeout=5000)
+                    await pkg_locator.click()
+                    log.info("Package selected", package=pkg_label)
+                except PwTimeout:
+                    # Try clicking the radio input near the package text
+                    radio = self.page.locator(
+                        f"input[type='radio']:near(:text('{pkg_label}'))"
+                    ).first
+                    try:
+                        await radio.click(timeout=5000)
+                        log.info("Package radio clicked", package=pkg_label)
+                    except PwTimeout:
+                        ss = await self._screenshot("stamp_package_not_found")
+                        return StampPurchaseResult(
+                            success=False, state=state,
+                            package_size=package_size, cost_usd=0,
+                            error=f"Could not find/select package: {pkg_label}",
+                            screenshot_path=ss,
+                        )
+
+                await self._human_delay()
+
+                # ── Click Next ──
+                next_btn = self.page.locator(
+                    "button:has-text('Next'), a:has-text('Next'), "
+                    "button:has-text('NEXT'), a:has-text('NEXT')"
+                ).first
+                await next_btn.wait_for(state="visible", timeout=10000)
+                await next_btn.click()
+                log.info("Clicked Next on stamp purchase")
+                await self.page.wait_for_timeout(4000)
+
+                # ── Check for logout (known flaky behavior) ──
+                if "/login" in self.page.url:
+                    log.warning("Logged out after clicking Next",
+                                attempt=attempt)
+                    self._logged_in = False
+                    if attempt < MAX_PURCHASE_ATTEMPTS:
+                        continue
+                    ss = await self._screenshot("stamp_purchase_logged_out")
+                    return StampPurchaseResult(
+                        success=False, state=state,
+                        package_size=package_size, cost_usd=0,
+                        error=f"Kept getting logged out after clicking Next "
+                              f"({MAX_PURCHASE_ATTEMPTS} attempts)",
+                        screenshot_path=ss,
+                    )
+
+                await self._screenshot("stamp_confirmation_page")
+
+                # ── Click Buy / Submit / Confirm on the confirmation page ──
+                buy_btn = None
+                for sel in [
+                    "button:has-text('Buy')", "button:has-text('BUY')",
+                    "button:has-text('Submit')", "button:has-text('SUBMIT')",
+                    "button:has-text('Confirm')", "button:has-text('CONFIRM')",
+                    "button:has-text('Purchase')", "button:has-text('PURCHASE')",
+                    "input[type='submit']",
+                ]:
+                    loc = self.page.locator(sel).first
+                    try:
+                        if await loc.is_visible(timeout=2000):
+                            buy_btn = loc
+                            break
+                    except Exception:
+                        continue
+
+                if not buy_btn:
+                    ss = await self._screenshot("stamp_no_buy_button")
+                    return StampPurchaseResult(
+                        success=False, state=state,
+                        package_size=package_size, cost_usd=0,
+                        error="Confirmation page loaded but Buy button not found",
+                        screenshot_path=ss,
+                    )
+
+                await buy_btn.click()
+                log.info("Clicked Buy on confirmation page")
+                await self.page.wait_for_timeout(4000)
+
+                # ── Check for logout again ──
+                if "/login" in self.page.url:
+                    log.warning("Logged out after clicking Buy", attempt=attempt)
+                    self._logged_in = False
+                    if attempt < MAX_PURCHASE_ATTEMPTS:
+                        continue
+                    ss = await self._screenshot("stamp_buy_logged_out")
+                    return StampPurchaseResult(
+                        success=False, state=state,
+                        package_size=package_size, cost_usd=0,
+                        error="Logged out after clicking Buy",
+                        screenshot_path=ss,
+                    )
+
+                await self._screenshot("stamp_purchase_complete")
+                log.info("Stamp purchase successful",
+                         state=state, package=package_size,
+                         cost=pkg["cost"])
+
+                return StampPurchaseResult(
+                    success=True, state=state,
+                    package_size=package_size, cost_usd=pkg["cost"],
+                )
+
+            except Exception as e:
+                log.error("Stamp purchase error",
+                          error=str(e), state=state, attempt=attempt)
+                if "/login" in self.page.url:
+                    self._logged_in = False
+                    if attempt < MAX_PURCHASE_ATTEMPTS:
+                        continue
+                ss = await self._screenshot("stamp_purchase_exception")
+                return StampPurchaseResult(
+                    success=False, state=state,
+                    package_size=package_size, cost_usd=0,
+                    error=str(e), screenshot_path=ss,
+                )
+
+        return StampPurchaseResult(
+            success=False, state=state,
+            package_size=package_size, cost_usd=0,
+            error=f"Failed after {MAX_PURCHASE_ATTEMPTS} attempts",
+        )
