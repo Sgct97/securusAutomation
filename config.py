@@ -62,6 +62,33 @@ class Settings(BaseSettings):
         default="WA,OK,NY,CA,AR",
         description="Comma-separated list of states to scrape"
     )
+    induction_lag_days: int = Field(
+        default=7,
+        ge=0,
+        le=90,
+        description=(
+            "Min days an inmate must be in our DB before we attempt outreach. "
+            "Securus often doesn't have brand-new bookings yet."
+        ),
+    )
+    contact_not_found_retry_days: int = Field(
+        default=30,
+        ge=1,
+        le=180,
+        description=(
+            "If Securus returns 'contact not found', keep retrying for this "
+            "many days before marking permanent. Gives new inmates time to "
+            "propagate into Securus' system."
+        ),
+    )
+    excluded_facility_keywords: str = Field(
+        default="waiting list,county jail,cnty waiting,co.309,cty 309,cc sentences",
+        description=(
+            "Comma-separated keywords — any inmate whose facility contains "
+            "one of these is skipped (e.g. county-jail waiting lists aren't "
+            "in Securus eMessaging)."
+        ),
+    )
     
     # =========================================================================
     # STAMP BUYING (Linda: adjust these to manage stamp purchasing)

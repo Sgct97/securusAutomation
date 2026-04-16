@@ -1,0 +1,106 @@
+[
+  {
+    "state": "WA",
+    "db_name": "BARKER, JONATHAN L",
+    "inmate_id": "448326",
+    "db_facility": "Washington State Penitentiary - IMU",
+    "agency_options": [
+      "City of Kent, WA",
+      "King County, WA",
+      "KITTITAS COUNTY SHERIFF'S OFFICE, WA",
+      "Lynnwood Police Department, WA",
+      "Score-South Correctional Entity, WA",
+      "Spokane County Detention Services-WA",
+      "WALLA WALLA COUNTY JAIL",
+      "Washington State Department of Corrections",
+      "Whatcom County Jail",
+      "Yakima County Jail Main and Annex, WA"
+    ],
+    "search_outcome": "CONTACT_NOT_FOUND_POPUP",
+    "error": null
+  },
+  {
+    "state": "WA",
+    "db_name": "VENEGAS, EMIL B",
+    "inmate_id": "441296",
+    "db_facility": "Washington Corrections Center - RC",
+    "agency_options": [],
+    "search_outcome": null,
+    "error": "Locator.click: Timeout 30000ms exceeded.\nCall log:\n  - waiting for locator(\"text=ADD CONTACT\").first\n"
+  },
+  {
+    "state": "OK",
+    "db_name": "DONYEL TYRONE JOHNSON",
+    "inmate_id": "0000457084",
+    "db_facility": "RED ROCK CORRECTIONAL CENTER",
+    "agency_options": [],
+    "search_outcome": null,
+    "error": "Locator.click: Timeout 30000ms exceeded.\nCall log:\n  - waiting for locator(\"text=Contacts\").first\n"
+  },
+  {
+    "state": "OK",
+    "db_name": "ERYC JESUS PANDO",
+    "inmate_id": "0000502459",
+    "db_facility": "JMM - OKLAHOMA CITY - CENTRAL",
+    "agency_options": [
+      "CHEROKEE COUNTY JAIL, OK",
+      "Oklahoma Department of Corrections"
+    ],
+    "search_outcome": "CONTACT_NOT_FOUND_POPUP",
+    "error": null
+  },
+  {
+    "state": "NY",
+    "db_name": "WHITE, RANDEISE",
+    "inmate_id": "26R0057",
+    "db_facility": "MIDSTATE",
+    "agency_options": [],
+    "search_outcome": null,
+    "error": "Locator.click: Timeout 30000ms exceeded.\nCall log:\n  - waiting for locator(\"text=ADD CONTACT\").first\n"
+  },
+  {
+    "state": "NY",
+    "db_name": "LOBDELL, KEVIN S",
+    "inmate_id": "26R0066",
+    "db_facility": "GROVELAND",
+    "agency_options": [],
+    "search_outcome": null,
+    "error": "Locator.click: Timeout 30000ms exceeded.\nCall log:\n  - waiting for locator(\"text=ADD CONTACT\").first\n"
+  },
+  {
+    "state": "CA",
+    "db_name": "KILGORE, MARCUS",
+    "inmate_id": "CC8057",
+    "db_facility": "Wasco State Prison",
+    "agency_options": [],
+    "search_outcome": null,
+    "error": "Locator.click: Target page, context or browser has been closed\nCall log:\n  - waiting for locator(\"text=ADD CONTACT\").first\n"
+  },
+  {
+    "state": "CA",
+    "db_name": "MENDOZA, ROSALINO HERNANDEZ",
+    "inmate_id": "CC8058",
+    "db_facility": "Wasco State Prison",
+    "agency_options": [],
+    "search_outcome": null,
+    "error": "Page.goto: Target page, context or browser has been closed"
+  },
+  {
+    "state": "AR",
+    "db_name": "Williams, Latisha M",
+    "inmate_id": "755085",
+    "db_facility": "McPherson Unit",
+    "agency_options": [],
+    "search_outcome": null,
+    "error": "Page.goto: Target page, context or browser has been closed"
+  },
+  {
+    "state": "AR",
+    "db_name": "Crews, Megan C",
+    "inmate_id": "755049",
+    "db_facility": "Womens Health Unit",
+    "agency_options": [],
+    "search_outcome": null,
+    "error": "Page.goto: Target page, context or browser has been closed"
+  }
+]

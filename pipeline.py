@@ -50,19 +50,52 @@ STATE_TO_AGENCY = {
 
 MAX_RETRIES = 3
 
-PERMANENT_FAILURE_MARKERS = [
-    "contact not found on securus",
+# Errors that are ALWAYS permanent — inmate will never appear in Securus
+TRULY_PERMANENT_MARKERS = [
     "emessaging not available",
     "agency not in dropdown",
+]
+
+# Errors that may clear up later (Securus sync lag) — retry within the
+# contact_not_found_retry_days window, then mark permanent.
+TRANSIENT_NOT_FOUND_MARKERS = [
+    "contact not found on securus",
     "no results found",
     "service may not be available",
 ]
 
 
-def _is_permanent_failure(error: str) -> bool:
-    """Errors that will never succeed on retry — don't waste time."""
+def _is_permanent_failure(error: str, inmate_discovered_at: Optional[datetime] = None) -> bool:
+    """Decide whether an error is permanent (never retry)."""
     err_lower = error.lower()
-    return any(marker in err_lower for marker in PERMANENT_FAILURE_MARKERS)
+
+    if any(marker in err_lower for marker in TRULY_PERMANENT_MARKERS):
+        return True
+
+    # "Contact not found" is only permanent if the inmate has been in our DB
+    # longer than the configured retry window — otherwise Securus may still
+    # be syncing them.
+    if any(marker in err_lower for marker in TRANSIENT_NOT_FOUND_MARKERS):
+        if inmate_discovered_at is None:
+            return False  # be safe — retry
+        age_days = (datetime.now(timezone.utc)
+                    - inmate_discovered_at.replace(
+                        tzinfo=inmate_discovered_at.tzinfo or timezone.utc)
+                    ).days
+        return age_days >= settings.contact_not_found_retry_days
+
+    return False
+
+
+def _is_excluded_facility(facility: Optional[str]) -> bool:
+    """True if the facility matches a keyword indicating it's NOT on
+    Securus eMessaging (e.g. county-jail waiting lists)."""
+    if not facility:
+        return False
+    fac_lower = facility.lower()
+    keywords = [k.strip().lower() for k in
+                settings.excluded_facility_keywords.split(",") if k.strip()]
+    return any(kw in fac_lower for kw in keywords)
 
 
 # =========================================================================
@@ -206,19 +239,27 @@ CANDIDATE_POOL_MULTIPLIER = 10
 async def get_pending_candidates(limit: int) -> list[dict]:
     """
     Pull a large pool of pending outreach candidates, distributed evenly
-    across states. The pool is CANDIDATE_POOL_MULTIPLIER * limit so the
-    send loop has plenty of fallbacks when individual inmates fail.
+    across states. Applies induction-lag and excluded-facility filters so
+    we don't waste attempts on inmates Securus can't find.
     """
     states = [s.strip() for s in settings.states_to_scrape.split(",") if s.strip()]
     pool_size = limit * CANDIDATE_POOL_MULTIPLIER
     per_state = max(1, pool_size // len(states))
     remainder = pool_size - (per_state * len(states))
 
+    induction_cutoff = (datetime.now(timezone.utc)
+                        - timedelta(days=settings.induction_lag_days))
+
     candidates = []
+    filtered_stats = {"excluded_facility": 0, "too_fresh": 0}
 
     async with async_session_factory() as session:
         for i, state in enumerate(states):
             state_limit = per_state + (1 if i < remainder else 0)
+
+            # Pull a larger raw pool so we have room to post-filter and
+            # still hit state_limit.
+            raw_limit = state_limit * 3
 
             result = await session.execute(
                 select(OutreachRecord, Inmate)
@@ -231,16 +272,25 @@ async def get_pending_candidates(limit: int) -> list[dict]:
                     ]),
                     OutreachRecord.retry_count < MAX_RETRIES,
                     ~Inmate.name.like("UNKNOWN%"),
+                    Inmate.discovered_at <= induction_cutoff,
                     or_(
                         OutreachRecord.next_retry_at == None,
                         OutreachRecord.next_retry_at <= datetime.now(timezone.utc),
                     ),
                 )
                 .order_by(Inmate.discovered_at.desc())
-                .limit(state_limit)
+                .limit(raw_limit)
             )
 
+            kept_for_state = 0
             for record, inmate in result.all():
+                if kept_for_state >= state_limit:
+                    break
+
+                if _is_excluded_facility(inmate.facility):
+                    filtered_stats["excluded_facility"] += 1
+                    continue
+
                 name_parts = inmate.name.split(",", 1)
                 if len(name_parts) == 2:
                     last_name = name_parts[0].strip()
@@ -262,10 +312,14 @@ async def get_pending_candidates(limit: int) -> list[dict]:
                     "state_full": STATE_ABBR_TO_FULL.get(inmate.state, inmate.state),
                     "facility": inmate.facility or "",
                     "agency": STATE_TO_AGENCY.get(inmate.state, ""),
+                    "discovered_at": inmate.discovered_at,
                 })
+                kept_for_state += 1
 
     log.info("Candidate pool loaded",
              pool_size=len(candidates), send_target=limit,
+             induction_lag_days=settings.induction_lag_days,
+             filtered=filtered_stats,
              by_state={s: sum(1 for c in candidates if c["state"] == s) for s in states})
     return candidates
 
@@ -327,9 +381,16 @@ async def ensure_stamps(client: SecurusClient, candidates: list[dict]) -> dict:
                      current=current, needed=needed)
             continue
 
-        agency = STATE_TO_AGENCY.get(state, "")
+        contact_name = await _get_contact_name_for_state(state)
+        if not contact_name:
+            log.warning("No known contact for state, cannot buy stamps",
+                        state=state)
+            stats["errors"].append(f"{state}: no contact in DB")
+            continue
+
         result = await client.purchase_stamps(
-            state=state, package_size=package["size"], agency_name=agency,
+            state=state, package_size=package["size"],
+            contact_name=contact_name,
         )
 
         if result.success:
@@ -363,6 +424,45 @@ async def _log_stamp_purchase(
             error_message=error,
         ))
         await session.commit()
+
+
+async def _get_contact_name_for_state(state: str) -> str | None:
+    """Look up a contact we've already added for this state.
+
+    Returns the Securus-style name (e.g. 'JUAN SOTELO') for a contact
+    that was successfully added or messaged. The name is derived from the
+    inmate's first and last name as stored in our DB.
+    """
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(Inmate)
+            .join(OutreachRecord)
+            .where(
+                Inmate.state == state,
+                OutreachRecord.status.in_([
+                    OutreachStatus.CONTACT_ADDED.value,
+                    OutreachStatus.MESSAGE_SENT.value,
+                ]),
+            )
+            .order_by(OutreachRecord.contact_added_at.desc())
+            .limit(1)
+        )
+        inmate = result.scalar_one_or_none()
+
+    if not inmate:
+        return None
+
+    # Parse "LAST, FIRST MIDDLE" → "FIRST LAST" (Securus dropdown format)
+    parts = inmate.name.split(",", 1)
+    if len(parts) == 2:
+        last = parts[0].strip()
+        first = parts[1].strip().split()[0]
+    else:
+        tokens = inmate.name.strip().split()
+        first = tokens[0] if tokens else ""
+        last = tokens[-1] if len(tokens) > 1 else ""
+
+    return f"{first} {last}".upper()
 
 
 # =========================================================================
@@ -427,7 +527,8 @@ async def send_outreach(
                 if not contact_result.success:
                     err = contact_result.error or "Unknown error"
                     if "already" not in err.lower():
-                        permanent = _is_permanent_failure(err)
+                        permanent = _is_permanent_failure(
+                            err, candidate.get("discovered_at"))
                         log.warning("Failed to add contact, trying next",
                                     name=candidate["name"], error=err,
                                     permanent=permanent)
@@ -466,7 +567,8 @@ async def send_outreach(
                     await _mark_failed(candidate["outreach_id"], f"send: {err}")
                     stats["failed"] += 1
                     break
-                permanent = _is_permanent_failure(err)
+                permanent = _is_permanent_failure(
+                    err, candidate.get("discovered_at"))
                 if permanent:
                     await _mark_permanently_failed(
                         candidate["outreach_id"], f"send: {err}")
@@ -518,21 +620,34 @@ async def _mark_sent(outreach_id: int):
 
 
 async def _mark_failed(outreach_id: int, error: str):
+    """Generic failure: increments retry_count, short backoff (6 h).
+    If the error is a transient 'contact not found', we use a longer
+    backoff (1 day) and do NOT increment retry_count — it will be retried
+    for contact_not_found_retry_days before being marked permanent.
+    """
+    is_transient = any(m in error.lower() for m in TRANSIENT_NOT_FOUND_MARKERS)
+
     async with async_session_factory() as session:
         record = (await session.execute(
             select(OutreachRecord).where(OutreachRecord.id == outreach_id)
         )).scalar_one()
 
-        record.retry_count += 1
         record.error_message = error
 
-        if record.retry_count >= MAX_RETRIES:
-            record.status = OutreachStatus.FAILED.value
-            log.warning("Max retries exceeded, marking as failed",
-                        outreach_id=outreach_id)
-        else:
+        if is_transient:
+            # Transient: retry daily without burning retry_count
             record.status = OutreachStatus.PENDING.value
-            record.next_retry_at = datetime.now(timezone.utc) + timedelta(hours=6)
+            record.next_retry_at = datetime.now(timezone.utc) + timedelta(days=1)
+        else:
+            record.retry_count += 1
+            if record.retry_count >= MAX_RETRIES:
+                record.status = OutreachStatus.FAILED.value
+                log.warning("Max retries exceeded, marking as failed",
+                            outreach_id=outreach_id)
+            else:
+                record.status = OutreachStatus.PENDING.value
+                record.next_retry_at = (datetime.now(timezone.utc)
+                                        + timedelta(hours=6))
 
         await session.commit()
 

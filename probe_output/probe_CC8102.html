@@ -1,0 +1,444 @@
+<!DOCTYPE html><html lang="en"><head>
+  <meta charset="UTF-8">
+  <link rel="icon" type="image/x-icon" href="./assets/favicon-2e146704.ico">
+  <link href="https://cdn.jsdelivr.net/npm/@mdi/font@5.x/css/materialdesignicons.min.css" rel="stylesheet">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>California Incarcerated Records &amp; Information Search (CIRIS) - CDCR</title>
+  <meta name="Author" content="California Department of Corrections and Rehabilitation (CDCR)">
+  <meta name="Description" content="The California Incarcerated Records &amp; Information Search (CIRIS) is an online tool to lookup individuals in CDCR custody. Search results include incarcerated person’s name, CDCR number, age, current location, commitment counties, admission date, Board of Parole Hearing dates and outcomes. The California Department of Corrections and Rehabilitation (CDCR) operates all State adult prisons and juvenile facilities, oversees a variety of community correctional facilities, and supervises all adult and juvenile incarcerated persons, including adults released to parole supervision.">
+  <meta name="Keywords" content="CDCR, California Inmate Locator, CDCR Inmate Locator, CIRIS, California Incarcerated Persons Record Search, California Offender Locator, CDCR Offender Locator, California Incarcerated Population Search, CDCR Incarcerated Population Lookup">
+  <meta name="language" content="English">
+
+
+  <script type="text/javascript" async="" src="https://www.google-analytics.com/analytics.js"></script><script type="text/javascript" async="" src="https://www.googletagmanager.com/gtag/js?id=G-3Z2V5385N6&amp;cx=c&amp;gtm=4e64f0"></script><script type="text/javascript" async="" src="https://www.googletagmanager.com/gtag/js?id=G-PKEWHLJMFM&amp;cx=c&amp;gtm=4e64f0"></script><script defer="" src="https://alert.cdt.ca.gov"></script>
+  <script type="module" crossorigin="" src="./assets/index-fdf616fa.js"></script>
+  <link rel="stylesheet" href="./assets/index-02ae9411.css">
+<style type="text/css" id="vuetify-theme-stylesheet">:root {
+      --v-theme-background: 255,255,255;
+      --v-theme-background-overlay-multiplier: 1;
+      --v-theme-surface: 255,255,255;
+      --v-theme-surface-overlay-multiplier: 1;
+      --v-theme-surface-variant: 66,66,66;
+      --v-theme-surface-variant-overlay-multiplier: 2;
+      --v-theme-on-surface-variant: 238,238,238;
+      --v-theme-primary: 16,73,19;
+      --v-theme-primary-overlay-multiplier: 2;
+      --v-theme-primary-darken-1: 55,0,179;
+      --v-theme-primary-darken-1-overlay-multiplier: 2;
+      --v-theme-secondary: 138,141,147;
+      --v-theme-secondary-overlay-multiplier: 1;
+      --v-theme-secondary-darken-1: 1,135,134;
+      --v-theme-secondary-darken-1-overlay-multiplier: 1;
+      --v-theme-error: 255,76,81;
+      --v-theme-error-overlay-multiplier: 1;
+      --v-theme-info: 22,177,255;
+      --v-theme-info-overlay-multiplier: 1;
+      --v-theme-success: 68,175,105;
+      --v-theme-success-overlay-multiplier: 1;
+      --v-theme-warning: 255,180,0;
+      --v-theme-warning-overlay-multiplier: 1;
+      --v-theme-secondary-background: 233,238,230;
+      --v-theme-secondary-background-overlay-multiplier: 1;
+      --v-theme-accent-text: 251,173,34;
+      --v-theme-accent-text-overlay-multiplier: 1;
+      --v-theme-accent: 13,110,253;
+      --v-theme-accent-overlay-multiplier: 1;
+      --v-theme-on-background: 0,0,0;
+      --v-theme-on-surface: 0,0,0;
+      --v-theme-on-primary: 255,255,255;
+      --v-theme-on-primary-darken-1: 255,255,255;
+      --v-theme-on-secondary: 255,255,255;
+      --v-theme-on-secondary-darken-1: 255,255,255;
+      --v-theme-on-error: 255,255,255;
+      --v-theme-on-info: 255,255,255;
+      --v-theme-on-success: 255,255,255;
+      --v-theme-on-warning: 0,0,0;
+      --v-theme-on-secondary-background: 0,0,0;
+      --v-theme-on-accent-text: 0,0,0;
+      --v-theme-on-accent: 255,255,255;
+      --v-border-color: 0, 0, 0;
+      --v-border-opacity: 0.12;
+      --v-high-emphasis-opacity: 0.87;
+      --v-medium-emphasis-opacity: 0.6;
+      --v-disabled-opacity: 0.38;
+      --v-idle-opacity: 0.04;
+      --v-hover-opacity: 0.04;
+      --v-focus-opacity: 0.12;
+      --v-selected-opacity: 0.08;
+      --v-activated-opacity: 0.12;
+      --v-pressed-opacity: 0.12;
+      --v-dragged-opacity: 0.08;
+      --v-theme-kbd: 33, 37, 41;
+      --v-theme-on-kbd: 255, 255, 255;
+      --v-theme-code: 245, 245, 245;
+      --v-theme-on-code: 0, 0, 0;
+    }
+    .v-theme--light {
+      color-scheme: normal;
+      --v-theme-background: 255,255,255;
+      --v-theme-background-overlay-multiplier: 1;
+      --v-theme-surface: 255,255,255;
+      --v-theme-surface-overlay-multiplier: 1;
+      --v-theme-surface-variant: 66,66,66;
+      --v-theme-surface-variant-overlay-multiplier: 2;
+      --v-theme-on-surface-variant: 238,238,238;
+      --v-theme-primary: 98,0,238;
+      --v-theme-primary-overlay-multiplier: 2;
+      --v-theme-primary-darken-1: 55,0,179;
+      --v-theme-primary-darken-1-overlay-multiplier: 2;
+      --v-theme-secondary: 3,218,198;
+      --v-theme-secondary-overlay-multiplier: 1;
+      --v-theme-secondary-darken-1: 1,135,134;
+      --v-theme-secondary-darken-1-overlay-multiplier: 1;
+      --v-theme-error: 176,0,32;
+      --v-theme-error-overlay-multiplier: 2;
+      --v-theme-info: 33,150,243;
+      --v-theme-info-overlay-multiplier: 1;
+      --v-theme-success: 76,175,80;
+      --v-theme-success-overlay-multiplier: 1;
+      --v-theme-warning: 251,140,0;
+      --v-theme-warning-overlay-multiplier: 1;
+      --v-theme-on-background: 0,0,0;
+      --v-theme-on-surface: 0,0,0;
+      --v-theme-on-primary: 255,255,255;
+      --v-theme-on-primary-darken-1: 255,255,255;
+      --v-theme-on-secondary: 0,0,0;
+      --v-theme-on-secondary-darken-1: 255,255,255;
+      --v-theme-on-error: 255,255,255;
+      --v-theme-on-info: 255,255,255;
+      --v-theme-on-success: 255,255,255;
+      --v-theme-on-warning: 255,255,255;
+      --v-border-color: 0, 0, 0;
+      --v-border-opacity: 0.12;
+      --v-high-emphasis-opacity: 0.87;
+      --v-medium-emphasis-opacity: 0.6;
+      --v-disabled-opacity: 0.38;
+      --v-idle-opacity: 0.04;
+      --v-hover-opacity: 0.04;
+      --v-focus-opacity: 0.12;
+      --v-selected-opacity: 0.08;
+      --v-activated-opacity: 0.12;
+      --v-pressed-opacity: 0.12;
+      --v-dragged-opacity: 0.08;
+      --v-theme-kbd: 33, 37, 41;
+      --v-theme-on-kbd: 255, 255, 255;
+      --v-theme-code: 245, 245, 245;
+      --v-theme-on-code: 0, 0, 0;
+    }
+    .v-theme--dark {
+      color-scheme: dark;
+      --v-theme-background: 18,18,18;
+      --v-theme-background-overlay-multiplier: 1;
+      --v-theme-surface: 33,33,33;
+      --v-theme-surface-overlay-multiplier: 1;
+      --v-theme-surface-variant: 189,189,189;
+      --v-theme-surface-variant-overlay-multiplier: 2;
+      --v-theme-on-surface-variant: 66,66,66;
+      --v-theme-primary: 187,134,252;
+      --v-theme-primary-overlay-multiplier: 2;
+      --v-theme-primary-darken-1: 55,0,179;
+      --v-theme-primary-darken-1-overlay-multiplier: 1;
+      --v-theme-secondary: 3,218,197;
+      --v-theme-secondary-overlay-multiplier: 2;
+      --v-theme-secondary-darken-1: 3,218,197;
+      --v-theme-secondary-darken-1-overlay-multiplier: 2;
+      --v-theme-error: 207,102,121;
+      --v-theme-error-overlay-multiplier: 2;
+      --v-theme-info: 33,150,243;
+      --v-theme-info-overlay-multiplier: 2;
+      --v-theme-success: 76,175,80;
+      --v-theme-success-overlay-multiplier: 2;
+      --v-theme-warning: 251,140,0;
+      --v-theme-warning-overlay-multiplier: 2;
+      --v-theme-on-background: 255,255,255;
+      --v-theme-on-surface: 255,255,255;
+      --v-theme-on-primary: 255,255,255;
+      --v-theme-on-primary-darken-1: 255,255,255;
+      --v-theme-on-secondary: 0,0,0;
+      --v-theme-on-secondary-darken-1: 0,0,0;
+      --v-theme-on-error: 255,255,255;
+      --v-theme-on-info: 255,255,255;
+      --v-theme-on-success: 255,255,255;
+      --v-theme-on-warning: 255,255,255;
+      --v-border-color: 255, 255, 255;
+      --v-border-opacity: 0.12;
+      --v-high-emphasis-opacity: 1;
+      --v-medium-emphasis-opacity: 0.7;
+      --v-disabled-opacity: 0.5;
+      --v-idle-opacity: 0.1;
+      --v-hover-opacity: 0.04;
+      --v-focus-opacity: 0.12;
+      --v-selected-opacity: 0.08;
+      --v-activated-opacity: 0.12;
+      --v-pressed-opacity: 0.16;
+      --v-dragged-opacity: 0.08;
+      --v-theme-kbd: 33, 37, 41;
+      --v-theme-on-kbd: 255, 255, 255;
+      --v-theme-code: 52, 52, 52;
+      --v-theme-on-code: 204, 204, 204;
+    }
+    .v-theme--cirisTheme {
+      color-scheme: normal;
+      --v-theme-background: 255,255,255;
+      --v-theme-background-overlay-multiplier: 1;
+      --v-theme-surface: 255,255,255;
+      --v-theme-surface-overlay-multiplier: 1;
+      --v-theme-surface-variant: 66,66,66;
+      --v-theme-surface-variant-overlay-multiplier: 2;
+      --v-theme-on-surface-variant: 238,238,238;
+      --v-theme-primary: 16,73,19;
+      --v-theme-primary-overlay-multiplier: 2;
+      --v-theme-primary-darken-1: 55,0,179;
+      --v-theme-primary-darken-1-overlay-multiplier: 2;
+      --v-theme-secondary: 138,141,147;
+      --v-theme-secondary-overlay-multiplier: 1;
+      --v-theme-secondary-darken-1: 1,135,134;
+      --v-theme-secondary-darken-1-overlay-multiplier: 1;
+      --v-theme-error: 255,76,81;
+      --v-theme-error-overlay-multiplier: 1;
+      --v-theme-info: 22,177,255;
+      --v-theme-info-overlay-multiplier: 1;
+      --v-theme-success: 68,175,105;
+      --v-theme-success-overlay-multiplier: 1;
+      --v-theme-warning: 255,180,0;
+      --v-theme-warning-overlay-multiplier: 1;
+      --v-theme-secondary-background: 233,238,230;
+      --v-theme-secondary-background-overlay-multiplier: 1;
+      --v-theme-accent-text: 251,173,34;
+      --v-theme-accent-text-overlay-multiplier: 1;
+      --v-theme-accent: 13,110,253;
+      --v-theme-accent-overlay-multiplier: 1;
+      --v-theme-on-background: 0,0,0;
+      --v-theme-on-surface: 0,0,0;
+      --v-theme-on-primary: 255,255,255;
+      --v-theme-on-primary-darken-1: 255,255,255;
+      --v-theme-on-secondary: 255,255,255;
+      --v-theme-on-secondary-darken-1: 255,255,255;
+      --v-theme-on-error: 255,255,255;
+      --v-theme-on-info: 255,255,255;
+      --v-theme-on-success: 255,255,255;
+      --v-theme-on-warning: 0,0,0;
+      --v-theme-on-secondary-background: 0,0,0;
+      --v-theme-on-accent-text: 0,0,0;
+      --v-theme-on-accent: 255,255,255;
+      --v-border-color: 0, 0, 0;
+      --v-border-opacity: 0.12;
+      --v-high-emphasis-opacity: 0.87;
+      --v-medium-emphasis-opacity: 0.6;
+      --v-disabled-opacity: 0.38;
+      --v-idle-opacity: 0.04;
+      --v-hover-opacity: 0.04;
+      --v-focus-opacity: 0.12;
+      --v-selected-opacity: 0.08;
+      --v-activated-opacity: 0.12;
+      --v-pressed-opacity: 0.12;
+      --v-dragged-opacity: 0.08;
+      --v-theme-kbd: 33, 37, 41;
+      --v-theme-on-kbd: 255, 255, 255;
+      --v-theme-code: 245, 245, 245;
+      --v-theme-on-code: 0, 0, 0;
+    }
+    .bg-background {
+      --v-theme-overlay-multiplier: var(--v-theme-background-overlay-multiplier);
+      background-color: rgb(var(--v-theme-background)) !important;
+      color: rgb(var(--v-theme-on-background)) !important;
+    }
+    .bg-surface {
+      --v-theme-overlay-multiplier: var(--v-theme-surface-overlay-multiplier);
+      background-color: rgb(var(--v-theme-surface)) !important;
+      color: rgb(var(--v-theme-on-surface)) !important;
+    }
+    .bg-surface-variant {
+      --v-theme-overlay-multiplier: var(--v-theme-surface-variant-overlay-multiplier);
+      background-color: rgb(var(--v-theme-surface-variant)) !important;
+      color: rgb(var(--v-theme-on-surface-variant)) !important;
+    }
+    .bg-primary {
+      --v-theme-overlay-multiplier: var(--v-theme-primary-overlay-multiplier);
+      background-color: rgb(var(--v-theme-primary)) !important;
+      color: rgb(var(--v-theme-on-primary)) !important;
+    }
+    .bg-primary-darken-1 {
+      --v-theme-overlay-multiplier: var(--v-theme-primary-darken-1-overlay-multiplier);
+      background-color: rgb(var(--v-theme-primary-darken-1)) !important;
+      color: rgb(var(--v-theme-on-primary-darken-1)) !important;
+    }
+    .bg-secondary {
+      --v-theme-overlay-multiplier: var(--v-theme-secondary-overlay-multiplier);
+      background-color: rgb(var(--v-theme-secondary)) !important;
+      color: rgb(var(--v-theme-on-secondary)) !important;
+    }
+    .bg-secondary-darken-1 {
+      --v-theme-overlay-multiplier: var(--v-theme-secondary-darken-1-overlay-multiplier);
+      background-color: rgb(var(--v-theme-secondary-darken-1)) !important;
+      color: rgb(var(--v-theme-on-secondary-darken-1)) !important;
+    }
+    .bg-error {
+      --v-theme-overlay-multiplier: var(--v-theme-error-overlay-multiplier);
+      background-color: rgb(var(--v-theme-error)) !important;
+      color: rgb(var(--v-theme-on-error)) !important;
+    }
+    .bg-info {
+      --v-theme-overlay-multiplier: var(--v-theme-info-overlay-multiplier);
+      background-color: rgb(var(--v-theme-info)) !important;
+      color: rgb(var(--v-theme-on-info)) !important;
+    }
+    .bg-success {
+      --v-theme-overlay-multiplier: var(--v-theme-success-overlay-multiplier);
+      background-color: rgb(var(--v-theme-success)) !important;
+      color: rgb(var(--v-theme-on-success)) !important;
+    }
+    .bg-warning {
+      --v-theme-overlay-multiplier: var(--v-theme-warning-overlay-multiplier);
+      background-color: rgb(var(--v-theme-warning)) !important;
+      color: rgb(var(--v-theme-on-warning)) !important;
+    }
+    .bg-secondary-background {
+      --v-theme-overlay-multiplier: var(--v-theme-secondary-background-overlay-multiplier);
+      background-color: rgb(var(--v-theme-secondary-background)) !important;
+      color: rgb(var(--v-theme-on-secondary-background)) !important;
+    }
+    .bg-accent-text {
+      --v-theme-overlay-multiplier: var(--v-theme-accent-text-overlay-multiplier);
+      background-color: rgb(var(--v-theme-accent-text)) !important;
+      color: rgb(var(--v-theme-on-accent-text)) !important;
+    }
+    .bg-accent {
+      --v-theme-overlay-multiplier: var(--v-theme-accent-overlay-multiplier);
+      background-color: rgb(var(--v-theme-accent)) !important;
+      color: rgb(var(--v-theme-on-accent)) !important;
+    }
+    .text-background {
+      color: rgb(var(--v-theme-background)) !important;
+    }
+    .border-background {
+      --v-border-color: var(--v-theme-background);
+    }
+    .text-surface {
+      color: rgb(var(--v-theme-surface)) !important;
+    }
+    .border-surface {
+      --v-border-color: var(--v-theme-surface);
+    }
+    .text-surface-variant {
+      color: rgb(var(--v-theme-surface-variant)) !important;
+    }
+    .border-surface-variant {
+      --v-border-color: var(--v-theme-surface-variant);
+    }
+    .on-surface-variant {
+      color: rgb(var(--v-theme-on-surface-variant)) !important;
+    }
+    .text-primary {
+      color: rgb(var(--v-theme-primary)) !important;
+    }
+    .border-primary {
+      --v-border-color: var(--v-theme-primary);
+    }
+    .text-primary-darken-1 {
+      color: rgb(var(--v-theme-primary-darken-1)) !important;
+    }
+    .border-primary-darken-1 {
+      --v-border-color: var(--v-theme-primary-darken-1);
+    }
+    .text-secondary {
+      color: rgb(var(--v-theme-secondary)) !important;
+    }
+    .border-secondary {
+      --v-border-color: var(--v-theme-secondary);
+    }
+    .text-secondary-darken-1 {
+      color: rgb(var(--v-theme-secondary-darken-1)) !important;
+    }
+    .border-secondary-darken-1 {
+      --v-border-color: var(--v-theme-secondary-darken-1);
+    }
+    .text-error {
+      color: rgb(var(--v-theme-error)) !important;
+    }
+    .border-error {
+      --v-border-color: var(--v-theme-error);
+    }
+    .text-info {
+      color: rgb(var(--v-theme-info)) !important;
+    }
+    .border-info {
+      --v-border-color: var(--v-theme-info);
+    }
+    .text-success {
+      color: rgb(var(--v-theme-success)) !important;
+    }
+    .border-success {
+      --v-border-color: var(--v-theme-success);
+    }
+    .text-warning {
+      color: rgb(var(--v-theme-warning)) !important;
+    }
+    .border-warning {
+      --v-border-color: var(--v-theme-warning);
+    }
+    .on-background {
+      color: rgb(var(--v-theme-on-background)) !important;
+    }
+    .on-surface {
+      color: rgb(var(--v-theme-on-surface)) !important;
+    }
+    .on-primary {
+      color: rgb(var(--v-theme-on-primary)) !important;
+    }
+    .on-primary-darken-1 {
+      color: rgb(var(--v-theme-on-primary-darken-1)) !important;
+    }
+    .on-secondary {
+      color: rgb(var(--v-theme-on-secondary)) !important;
+    }
+    .on-secondary-darken-1 {
+      color: rgb(var(--v-theme-on-secondary-darken-1)) !important;
+    }
+    .on-error {
+      color: rgb(var(--v-theme-on-error)) !important;
+    }
+    .on-info {
+      color: rgb(var(--v-theme-on-info)) !important;
+    }
+    .on-success {
+      color: rgb(var(--v-theme-on-success)) !important;
+    }
+    .on-warning {
+      color: rgb(var(--v-theme-on-warning)) !important;
+    }
+    .text-secondary-background {
+      color: rgb(var(--v-theme-secondary-background)) !important;
+    }
+    .border-secondary-background {
+      --v-border-color: var(--v-theme-secondary-background);
+    }
+    .text-accent-text {
+      color: rgb(var(--v-theme-accent-text)) !important;
+    }
+    .border-accent-text {
+      --v-border-color: var(--v-theme-accent-text);
+    }
+    .text-accent {
+      color: rgb(var(--v-theme-accent)) !important;
+    }
+    .border-accent {
+      --v-border-color: var(--v-theme-accent);
+    }
+    .on-secondary-background {
+      color: rgb(var(--v-theme-on-secondary-background)) !important;
+    }
+    .on-accent-text {
+      color: rgb(var(--v-theme-on-accent-text)) !important;
+    }
+    .on-accent {
+      color: rgb(var(--v-theme-on-accent)) !important;
+    }
+</style><script src="https://alert.cdt.ca.gov" defer="" crossorigin="anonymous"></script></head>
+
+<body>
+  <div id="app" data-v-app=""><div data-v-2d1f7278="" class="v-application v-theme--cirisTheme v-layout v-layout--full-height v-locale--is-ltr" style="z-index: 1000;"><div class="v-application__wrap"><header data-v-2d1f7278="" class="v-toolbar v-toolbar--flat v-toolbar--density-default bg-primary v-theme--cirisTheme v-locale--is-ltr v-app-bar" style="top: 0px; z-index: 1006; transform: translateY(0%); position: fixed; left: 0px; width: calc(100% + 0px);"><!----><div class="v-toolbar__content" style="height: 60px;"><!----><!----><a data-v-2d1f7278="" aria-label="California State Website" href="https://www.ca.gov/" rel="no-referrer" target="_blank"><div data-v-2d1f7278="" class="v-responsive v-img ml-3 pa-2" aria-label="ca.gov Logo" role="img" style="max-width: 45px; min-width: 45px;"><div class="v-responsive__sizer" style="padding-bottom: 56.6667%;"></div><img class="v-img__img v-img__img--contain" src="data:image/png;base64,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" alt="ca.gov Logo" style=""><!----><!----><!----><!----><!----></div></a><hr data-v-2d1f7278="" class="v-divider v-divider--inset v-divider--vertical v-theme--cirisTheme ms-3 border-opacity-50" aria-orientation="vertical" role="separator" style="border-right-width: 2px;"><a data-v-2d1f7278="" aria-label="California Departmenet of Corrections and Rehabilitation Website" href="https://www.cdcr.ca.gov/" rel="no-referrer" target="_blank"><div data-v-2d1f7278="" class="v-responsive v-img ml-3 pa-2" aria-label="CDCR Logo" role="img" style="max-width: 45px; min-width: 45px;"><div class="v-responsive__sizer" style="padding-bottom: 100%;"></div><img class="v-img__img v-img__img--contain" src="https://ciris.mt.cdcr.ca.gov/assets/logo-9bfecec1.svg" alt="CDCR Logo" style=""><!----><!----><!----><!----><!----></div></a><a data-v-2d1f7278="" href="." rel="no-referrer" style="text-decoration: none;"><div data-v-2d1f7278="" class="font-weight-medium text-h6 ml-3" style="line-height: 18px;"><span data-v-2d1f7278="" style="color: rgb(var(--v-theme-accent-text));">CDCR </span><span data-v-2d1f7278="" style="color: white;">California Incarcerated Records and Information Search (CIRIS)</span></div></a><!----></div><!----></header><!----><main data-v-2d1f7278="" class="v-main" style="--v-layout-left: 0px; --v-layout-right: 0px; --v-layout-top: 60px; --v-layout-bottom: 0px;"><div><div class="px-0 pb-0 mx-0 mt-4"><div class="v-row v-row--no-gutters px-0 mx-2"><div class="v-col"><button type="button" class="v-btn v-theme--cirisTheme text-primary v-btn--density-default v-btn--size-default v-btn--variant-text font-weight-bold" style="letter-spacing: 0px;"><span class="v-btn__overlay"></span><span class="v-btn__underlay"></span><!----><span class="v-btn__content" data-no-activator="">&lt; Return to Search</span><!----><!----></button></div></div></div></div><div class="ma-5 mt-2"><div class="v-row pa-4"><div class="v-col v-col-12"><p class="text-h5"> Search Result for CDCR Number - CC8102</p><!----></div><div class="v-col v-col-12"><div class="v-row justify-center"><div class="v-col-md-6 v-col-12"><div align="center"><p class="text-h4">No Results</p><p class="text-h6 mt-3"> We cannot find a person with this name or CDCR number.<br> Please check your search terms and try again. </p><button type="button" class="v-btn v-theme--cirisTheme text-primary v-btn--density-default v-btn--size-default v-btn--variant-outlined mt-3 font-weight-bold"><span class="v-btn__overlay"></span><span class="v-btn__underlay"></span><!----><span class="v-btn__content" data-no-activator="">new search</span><!----><!----></button></div><div class="mt-4"> Tips for searching <ul class="ml-5 mt-2"><li> Check the spelling of the name. You can also use the first few letters of the name. </li><li>Check the CDCR number.</li></ul><div class="mt-3 justify"> This site searches adult incarcerated persons in California Department of Corrections and Rehabilitation (CDCR) facilities. For more ways to look up incarcerated persons. </div><div class="mt-3"><button data-v-0968871b="" type="button" class="v-btn v-theme--cirisTheme text-primary v-btn--density-default v-btn--size-default v-btn--variant-text mr-4" aria-haspopup="dialog" aria-expanded="false"><span class="v-btn__overlay"></span><span class="v-btn__underlay"></span><!----><span class="v-btn__content" data-no-activator="">try other sites</span><!----><!----></button><!----></div><button data-v-0968871b="" type="button" class="v-btn v-theme--cirisTheme text-primary v-btn--density-default v-btn--size-default v-btn--variant-text mr-4" aria-haspopup="dialog" aria-expanded="false"><span class="v-btn__overlay"></span><span class="v-btn__underlay"></span><!----><span class="v-btn__content" data-no-activator="">contact cdcr</span><!----><!----></button><!----></div></div></div></div><!----></div></div></main><footer data-v-2d1f7278="" class="v-footer v-theme--cirisTheme bg-primary pl-10" flat="" style="height: auto; max-height: 40px;"><div data-v-2d1f7278="" class="v-row v-row--no-gutters text-subtitle-2 font-weight-bold"><div data-v-2d1f7278="" class="v-col-md-auto v-col-12"><a data-v-2d1f7278="" class="v-btn v-theme--cirisTheme text-white v-btn--density-default v-btn--size-default v-btn--variant-text text-subtitle-2 font-weight-bold" href="https://www.cdcr.ca.gov/accessibility/" aria-label="CDCR Accessibility Resources" rel="no-referrer" target="_blank"><span class="v-btn__overlay"></span><span class="v-btn__underlay"></span><!----><span class="v-btn__content" data-no-activator="">Accessibility </span><!----><!----></a></div><div data-v-2d1f7278="" class="v-col-md-auto v-col-12"><a data-v-2d1f7278="" class="v-btn v-theme--cirisTheme text-white v-btn--density-default v-btn--size-default v-btn--variant-text text-subtitle-2 font-weight-bold" href="https://www.cdcr.ca.gov/conditions-of-use/" aria-label="Website Conditions Of Use" rel="no-referrer" target="_blank"><span class="v-btn__overlay"></span><span class="v-btn__underlay"></span><!----><span class="v-btn__content" data-no-activator="">Conditions of Use </span><!----><!----></a></div><div data-v-2d1f7278="" class="v-col-md-auto v-col-12"><a data-v-2d1f7278="" class="v-btn v-theme--cirisTheme text-white v-btn--density-default v-btn--size-default v-btn--variant-text text-subtitle-2 font-weight-bold" href="https://www.cdcr.ca.gov/privacy-policy/" aria-label="CDCR Privacy Policies" rel="no-referrer" target="_blank"><span class="v-btn__overlay"></span><span class="v-btn__underlay"></span><!----><span class="v-btn__content" data-no-activator="">Privacy Policy </span><!----><!----></a></div><div data-v-2d1f7278="" class="v-col"></div><div data-v-2d1f7278="" class="v-col-md-5 v-col-12 align-self-center">© Copyright 2023 California Department of Corrections &amp; Rehabilitation</div></div></footer></div></div></div>
+  
+
+
+<script async="" src="https://www.googletagmanager.com/gtm.js?id=GTM-WWJWHL4"></script><script type="text/javascript" id="" charset="">document.head.appendChild(Object.assign(document.createElement("script"),{src:"https://alert.cdt.ca.gov",defer:!0,crossOrigin:"anonymous"}));</script></body></html>

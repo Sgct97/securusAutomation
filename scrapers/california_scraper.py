@@ -84,8 +84,17 @@ async def search_cdcr(page: Page, cdcr_num: str) -> Optional[dict]:
 
     text = await page.evaluate("() => document.body.innerText")
 
-    if "0-0 of 0" in text and cdcr_num not in text:
+    # CDCR echoes the search term (e.g. "Search Result for CDCR Number - CC8109")
+    # even when no inmate exists, so we must check explicit no-result markers
+    # before treating the page as a hit.
+    no_result_markers = [
+        "No Results",
+        "We cannot find a person",
+        "0-0 of 0",
+    ]
+    if any(m in text for m in no_result_markers):
         return None
+
     if cdcr_num not in text:
         return None
 
@@ -113,12 +122,14 @@ async def search_cdcr(page: Page, cdcr_num: str) -> Optional[dict]:
                     facility = l
             break
 
+    # If we got past the no-result check but still can't find a name,
+    # DO NOT store a phantom record. Return None and let the caller
+    # log/skip. This fixes the bug where every non-result was being
+    # saved as "UNKNOWN (CCxxxx)".
     if not name:
-        if cdcr_num in text:
-            log.warning("CDCR# found but parse failed", cdcr=cdcr_num)
-            name = f"UNKNOWN ({cdcr_num})"
-        else:
-            return None
+        log.warning("Page had no no-result marker but name parse failed; skipping",
+                    cdcr=cdcr_num)
+        return None
 
     return {
         "cdcr_num": cdcr_num,
