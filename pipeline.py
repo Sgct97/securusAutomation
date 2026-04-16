@@ -56,12 +56,15 @@ TRULY_PERMANENT_MARKERS = [
     "agency not in dropdown",
 ]
 
-# Errors that may clear up later (Securus sync lag) — retry within the
-# contact_not_found_retry_days window, then mark permanent.
+# Errors that may clear up later (Securus sync lag, stamp purchase, etc.)
+# — retry within the contact_not_found_retry_days window, then mark
+# permanent. Insufficient-stamps is transient because it resolves as
+# soon as we (or Linda) buy stamps for that facility.
 TRANSIENT_NOT_FOUND_MARKERS = [
     "contact not found on securus",
     "no results found",
     "service may not be available",
+    "insufficient stamps at facility",
 ]
 
 

@@ -261,6 +261,72 @@ class SecurusClient:
         """Small random delay to mimic human behavior."""
         await self.page.wait_for_timeout(random.randint(min_ms, max_ms))
 
+    async def _detect_insufficient_stamps(self) -> Optional[str]:
+        """
+        After a contact is selected on the Compose page, detect whether
+        Securus is blocking the send due to 0 stamps at that facility.
+
+        Securus reacts to the "0 Stamps Available" state by:
+          - Disabling the subject <input>
+          - Optionally showing an "Insufficient Stamps" popup
+          - Rendering text like "<Facility>: 0 Stamps Available"
+
+        Returns the facility name (str) if a shortage is detected,
+        otherwise None. Fast — intentionally uses short timeouts so we
+        don't add latency to the happy path.
+        """
+        # Path 1: explicit "Insufficient Stamps" modal
+        try:
+            modal = self.page.locator("text=Insufficient Stamps").first
+            await modal.wait_for(state="visible", timeout=1500)
+            body_text = (await self.page.locator("body").text_content()) or ""
+            # Pull out the facility name from the "<fac>: 0 Stamps Available"
+            # pattern if it's there.
+            m = re.search(r"([^\n]{3,120}?):\s*0\s*Stamps?\s*Available",
+                          body_text, re.IGNORECASE)
+            facility = m.group(1).strip() if m else "unknown facility"
+            log.warning("Insufficient stamps detected via modal",
+                        facility=facility)
+            # Try to dismiss so subsequent retries start clean.
+            for btn_sel in ["button:has-text('Cancel')",
+                            "button:has-text('Close')",
+                            "button:has-text('OK')"]:
+                try:
+                    b = self.page.locator(btn_sel).first
+                    if await b.is_visible(timeout=500):
+                        await b.click()
+                        await self.page.wait_for_timeout(500)
+                        break
+                except Exception:
+                    continue
+            return facility
+        except PwTimeout:
+            pass
+
+        # Path 2: no modal yet, but the subject input is already disabled
+        # AND the page shows a zero-balance marker.
+        try:
+            subject_disabled = await self.page.evaluate(
+                """() => {
+                    const el = document.querySelector(
+                        "input#subject, input[name='subject']");
+                    return !!(el && el.disabled);
+                }""")
+        except Exception:
+            subject_disabled = False
+
+        if subject_disabled:
+            body_text = (await self.page.locator("body").text_content()) or ""
+            if "0 Stamps Available" in body_text or "until you have purchased stamps" in body_text:
+                m = re.search(r"([^\n]{3,120}?):\s*0\s*Stamps?\s*Available",
+                              body_text, re.IGNORECASE)
+                facility = m.group(1).strip() if m else "unknown facility"
+                log.warning("Insufficient stamps detected via disabled subject",
+                            facility=facility)
+                return facility
+
+        return None
+
     # =========================================================================
     # LOGIN
     # =========================================================================
@@ -727,6 +793,23 @@ class SecurusClient:
                 )
             except PwTimeout:
                 pass
+
+            # Detect "Insufficient Stamps" before attempting to compose — Securus
+            # disables the subject input when there are 0 stamps at the contact's
+            # facility. Without this check, the downstream subject-click would
+            # time out for 30s and the whole outreach would be marked as a
+            # generic Playwright failure.
+            insufficient = await self._detect_insufficient_stamps()
+            if insufficient:
+                ss = await self._screenshot("insufficient_stamps")
+                return MessageResult(
+                    success=False,
+                    contact_name=contact_name,
+                    subject=subject,
+                    error=(f"Insufficient stamps at facility: "
+                           f"{insufficient}"),
+                    screenshot_path=ss,
+                )
 
             # Fill subject — use type() to trigger Angular validation
             subject_input = self.page.locator("input#subject, input[name='subject']").first
