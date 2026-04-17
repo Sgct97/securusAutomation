@@ -97,6 +97,25 @@ AGENCY_TO_STATE = {
     "arkansas doc": "AR",
 }
 
+# Reverse mapping used during add_contact: given our scraped inmate's
+# state code, what's the DEFAULT agency name to pick in Securus' Agency
+# dropdown when our stored facility name (e.g. "JACKIE BRANNON
+# CORRECTIONAL CENTER") doesn't match any dropdown option (Securus only
+# exposes one or two statewide "umbrella" agencies per state, not every
+# physical prison). This prevented all 354 historical OK add_contact
+# attempts from succeeding — our code kept returning "Agency not in
+# dropdown" because none of our facility strings matched the two OK
+# agency options. Substring/reverse-substring matches still run first
+# so state-specific deviations (e.g. a future county jail) are still
+# reachable; this map is the fallback.
+STATE_TO_AGENCY_HINT = {
+    "OK": "oklahoma department of corrections",
+    "WA": "washington state department of corrections",
+    "NY": "nys doccs inmate services",
+    "CA": "california department of corrections & rehabilitation",
+    "AR": "arkansas doc",
+}
+
 
 class SecurusClient:
     """
@@ -113,6 +132,7 @@ class SecurusClient:
     MY_ACCOUNT_URL = "https://securustech.online/#/my-account"
     DEBIT_CONTACTS_URL = "https://securustech.online/#/products/securus-debit/contacts"
     EMESSAGE_INBOX_URL = "https://securustech.online/#/products/emessage/inbox"
+    EMESSAGE_CONTACTS_URL = "https://securustech.online/#/products/emessage/contacts"
     STAMPS_TOTAL_URL = "https://securustech.online/#/products/emessage/stamps/totalStamps"
     STAMPS_PURCHASE_URL = "https://securustech.online/#/products/emessage/stamps/purchase"
 
@@ -408,9 +428,76 @@ class SecurusClient:
         state: str,
         facility: str,
         inmate_id: Optional[str] = None,
+        max_attempts: int = 3,
     ) -> ContactResult:
         """
-        Add an inmate as an eMessaging contact.
+        Add an inmate as an eMessaging contact, retrying on mid-flow logouts.
+
+        Retries up to *max_attempts* on logout/exception. Definitive failures
+        (contact not found, agency missing, etc.) return immediately — no
+        point retrying those.
+        """
+        # Prewarm the session before entering the real add-contact flow.
+        # purchase_stamps gained this step and stopped seeing mid-flow
+        # logouts; add_contact previously jumped straight to /emessage/inbox
+        # and was getting its session killed ~2 minutes in (empirically
+        # verified: add_contact for Douglas Simpson died at the "ADD
+        # CONTACT" button click on all 3 attempts at the ~2 min mark on a
+        # 30 s cool-off). Prewarm visits /contacts and /inbox first to
+        # mimic a human browsing path and raise our ThreatMetrix score.
+        # Best-effort: never raises.
+        try:
+            await self.prewarm_session()
+        except Exception as e:
+            log.warning("Prewarm before add_contact failed (continuing)",
+                        error=str(e))
+
+        last_result: Optional[ContactResult] = None
+        for attempt in range(1, max(1, max_attempts) + 1):
+            log.info("add_contact attempt",
+                     attempt=attempt, max_attempts=max_attempts,
+                     name=f"{first_name} {last_name}", state=state)
+            result = await self._add_contact_once(
+                first_name=first_name, last_name=last_name,
+                state=state, facility=facility, inmate_id=inmate_id,
+            )
+            if result.success:
+                return result
+            last_result = result
+
+            err = (result.error or "").lower()
+            # Definitive: don't retry these
+            if any(m in err for m in (
+                "contact not found on securus",
+                "no results found",
+                "agency not in dropdown",
+                "state dropdown not found",
+                "no state dropdown",
+            )):
+                return result
+
+            if attempt < max_attempts:
+                log.warning("add_contact transient failure, retrying",
+                            attempt=attempt, error=result.error)
+                self._logged_in = False  # force re-login on next goto
+                await asyncio.sleep(random.uniform(3, 6))
+
+        return last_result or ContactResult(
+            success=False, inmate_id=inmate_id or "",
+            name=f"{first_name} {last_name}", state=state,
+            facility=facility, error="add_contact exhausted retries",
+        )
+
+    async def _add_contact_once(
+        self,
+        first_name: str,
+        last_name: str,
+        state: str,
+        facility: str,
+        inmate_id: Optional[str] = None,
+    ) -> ContactResult:
+        """
+        Single-attempt implementation of the add-contact flow.
 
         Flow: eMessaging → Contacts → Add Contact → fill form → Search →
               click Add Contact on result → confirm popup.
@@ -423,8 +510,10 @@ class SecurusClient:
                  state=state, inmate_id=inmate_id)
 
         try:
-            # Navigate to eMessaging inbox, then Contacts
-            await self.page.goto(self.EMESSAGE_INBOX_URL, wait_until="domcontentloaded")
+            # Navigate to eMessaging inbox via the re-login-safe helper.
+            # Raw page.goto would leave us stranded on /login if the session
+            # dies mid-navigation (a common Securus behavior).
+            await self._goto_or_relogin(self.EMESSAGE_INBOX_URL, max_retries=3)
             await self.page.wait_for_timeout(2000)
             await self._dismiss_overlays()
 
@@ -436,13 +525,33 @@ class SecurusClient:
             await self.page.wait_for_timeout(2000)
 
             if inmate_id:
+                # Per-state ID normalization before submitting to Securus.
+                # Our scraper stores OK DOC IDs zero-padded to 10 chars
+                # (e.g. "0000134726"), but Securus' OK DOC agency search
+                # rejects that padding — it only accepts the trimmed form
+                # ("134726"). This mismatch silently failed all 354 OK
+                # add_contact attempts on the droplet before this fix.
+                # Confirmed against the live Securus UI: searching Douglas
+                # Simpson by the stripped ID finds him; the padded form
+                # does not.
+                # All other states (CA/WA/AR/NY) are already stored in
+                # their native Securus format (CA "CC8032", WA "893117",
+                # AR "186001", NY "26R0001"), so we only strip for OK.
+                search_id = inmate_id
+                if state.upper() == "OK":
+                    stripped = inmate_id.lstrip("0")
+                    if stripped and stripped != inmate_id:
+                        log.info("Stripped OK ID leading zeros",
+                                 raw=inmate_id, stripped=stripped)
+                        search_id = stripped
+
                 # Switch to ID radio
                 id_radio = self.page.locator("input[type='radio']").nth(1)
                 await id_radio.click()
                 await self._human_delay()
 
                 visible_inputs = self.page.locator("input[type='text']:visible")
-                await visible_inputs.first.fill(inmate_id)
+                await visible_inputs.first.fill(search_id)
             else:
                 name_radio = self.page.locator("input[type='radio']").first
                 await name_radio.click()
@@ -511,7 +620,7 @@ class SecurusClient:
                     real_opts = [o for o in options if o["text"].strip().lower() != "select"]
 
                     matched = None
-                    # 1) Exact substring match
+                    # 1) Exact substring match (our facility contains dropdown text)
                     for opt in real_opts:
                         if facility.lower() in opt["text"].lower():
                             matched = opt
@@ -522,7 +631,24 @@ class SecurusClient:
                             if opt["text"].lower() in facility.lower():
                                 matched = opt
                                 break
-                    # 3) If only one real option, use it
+                    # 3) State-level agency hint — covers states where our
+                    #    stored facility name (e.g. "Jackie Brannon
+                    #    Correctional Center") doesn't match either Securus
+                    #    agency option ("Oklahoma Department of Corrections"
+                    #    / "CHEROKEE COUNTY JAIL, OK"). Previously this
+                    #    caused every OK add_contact to fail.
+                    if not matched:
+                        hint = STATE_TO_AGENCY_HINT.get(state.upper())
+                        if hint:
+                            for opt in real_opts:
+                                if hint in opt["text"].lower():
+                                    matched = opt
+                                    log.info("Matched agency via "
+                                             "STATE_TO_AGENCY_HINT",
+                                             state=state, hint=hint,
+                                             matched=opt["text"])
+                                    break
+                    # 4) If only one real option, use it
                     if not matched and len(real_opts) == 1:
                         matched = real_opts[0]
 
@@ -677,21 +803,16 @@ class SecurusClient:
         contact_name: str,
         subject: str,
         body: str,
+        max_attempts: int = 3,
     ) -> MessageResult:
         """
-        Send an eMessage to an existing contact.
+        Send an eMessage to an existing contact, retrying on mid-flow logouts.
 
-        The contact must already be in the eMessaging contacts list
-        (i.e., added via add_contact first).
-
-        Args:
-            contact_name: Exact name as it appears in the contacts dropdown
-            subject: Message subject line
-            body: Message body text
-
-        Returns:
-            MessageResult with success/failure details
+        Retries up to *max_attempts* on logout/exception. Definitive failures
+        (insufficient stamps at facility, contact missing from dropdown, cap
+        reached) return immediately — retrying them just burns session.
         """
+        # Hourly cap is a hard definitive stop; skip the retry loop.
         if not self._check_hourly_cap():
             return MessageResult(
                 success=False,
@@ -700,14 +821,55 @@ class SecurusClient:
                 error=f"Hourly message cap reached ({settings.securus_max_messages_per_hour}/hr)",
             )
 
+        last_result: Optional[MessageResult] = None
+        for attempt in range(1, max(1, max_attempts) + 1):
+            log.info("send_message attempt",
+                     attempt=attempt, max_attempts=max_attempts,
+                     contact=contact_name)
+            result = await self._send_message_once(
+                contact_name=contact_name, subject=subject, body=body,
+            )
+            if result.success:
+                return result
+            last_result = result
+
+            err = (result.error or "").lower()
+            # Definitive: don't retry these
+            if any(m in err for m in (
+                "insufficient stamps at facility",
+                "contact not found in contacts dropdown",
+                "hourly message cap reached",
+            )):
+                return result
+
+            if attempt < max_attempts:
+                log.warning("send_message transient failure, retrying",
+                            attempt=attempt, error=result.error)
+                self._logged_in = False  # force re-login on next goto
+                await asyncio.sleep(random.uniform(3, 6))
+
+        return last_result or MessageResult(
+            success=False, contact_name=contact_name, subject=subject,
+            error="send_message exhausted retries",
+        )
+
+    async def _send_message_once(
+        self,
+        contact_name: str,
+        subject: str,
+        body: str,
+    ) -> MessageResult:
+        """Single-attempt send flow. Retry wrapper is in send_message()."""
         await self._ensure_logged_in()
         await self._rate_limit()
 
         log.info("Sending message", contact=contact_name, subject=subject)
 
         try:
-            # Navigate to eMessaging inbox and click Compose
-            await self.page.goto(self.EMESSAGE_INBOX_URL, wait_until="domcontentloaded")
+            # Navigate to eMessaging inbox via the re-login-safe helper
+            # so a mid-flight logout retries rather than stranding us on
+            # the login page.
+            await self._goto_or_relogin(self.EMESSAGE_INBOX_URL, max_retries=3)
             await self.page.wait_for_timeout(3000)
             await self._dismiss_overlays()
 
@@ -1026,11 +1188,81 @@ class SecurusClient:
 
     @staticmethod
     def _pick_package(deficit: int) -> dict:
-        """Return the smallest stamp package that covers the deficit."""
+        """Legacy fallback (static list). Prefer purchase_stamps(needed=...)
+        which discovers real packages from the live page."""
         for pkg in STAMP_PACKAGES:
             if pkg["size"] >= deficit:
                 return pkg
         return STAMP_PACKAGES[-1]
+
+    async def _discover_stamp_packages(self) -> list[dict]:
+        """
+        Enumerate stamp-package radios rendered on the Purchase page after a
+        contact is selected, and return ``[{size, cost, radio_id, label_text}]``
+        sorted by size.
+
+        The live page labels look like "500 Stamps ($ 5)" or "60 Stamps Package
+        ($ 10.00)" depending on the facility, so we parse both forms with a
+        single regex.
+        """
+        raw = await self.page.evaluate(r"""() => {
+            const out = [];
+            document.querySelectorAll('input[type="radio"]').forEach(el => {
+                const cs = window.getComputedStyle(el);
+                const visible = cs.display !== 'none'
+                    && cs.visibility !== 'hidden';
+                let label = null;
+                if (el.id) {
+                    const lbl = document.querySelector(
+                        `label[for="${el.id}"]`);
+                    if (lbl) label = lbl.textContent.trim();
+                }
+                if (!label && el.closest('label')) {
+                    label = el.closest('label').textContent.trim();
+                }
+                out.push({
+                    id: el.id || '',
+                    name: el.name || '',
+                    value: el.value || '',
+                    visible,
+                    disabled: el.disabled,
+                    label: label || '',
+                });
+            });
+            return out;
+        }""")
+
+        pkgs: list[dict] = []
+        # Matches "500 Stamps ($ 5)", "60 Stamps Package ($ 10.00)",
+        # "1000 Stamps($ 50)", etc.
+        label_re = re.compile(
+            r"(\d[\d,]*)\s*Stamps?(?:\s*Package)?\s*"
+            r"\(\s*\$\s*([\d]+(?:\.\d+)?)\s*\)",
+            re.IGNORECASE,
+        )
+
+        for r in raw:
+            if not r["visible"] or r["disabled"]:
+                continue
+            m = label_re.search(r["label"])
+            if not m:
+                continue
+            try:
+                size = int(m.group(1).replace(",", ""))
+                cost = float(m.group(2))
+            except ValueError:
+                continue
+            if size <= 0:
+                continue
+            pkgs.append({
+                "size": size,
+                "cost": cost,
+                "radio_id": r["id"],
+                "label_text": r["label"],
+            })
+
+        pkgs.sort(key=lambda p: p["size"])
+        return pkgs
 
     async def _goto_or_relogin(self, url: str, max_retries: int = 10) -> None:
         """Navigate to *url*. If the site redirects to login, re-authenticate
@@ -1049,6 +1281,30 @@ class SecurusClient:
             self._logged_in = False
             await asyncio.sleep(random.uniform(3, 6))
             await self.login()
+
+    async def prewarm_session(self) -> None:
+        """
+        Visit Contacts and Inbox before touching money-moving pages.
+
+        Empirical finding (see probe_output/logout_forensics_*.jsonl):
+        Securus' ThreatMetrix scoring (valcontent.securustech.net/fp/HP)
+        drops sessions that jump straight from login -> /stamps/purchase.
+        A login -> /contacts -> /inbox -> /stamps/* path mirrors a real
+        user and keeps the session alive.
+
+        Best-effort: never raises; a logout mid-prewarm is tolerated.
+        Call before ensure_stamps / add_contact / send_message loops.
+        """
+        for url in (self.EMESSAGE_CONTACTS_URL, self.EMESSAGE_INBOX_URL):
+            try:
+                await self._goto_or_relogin(url, max_retries=3)
+                # Small idle so XHR/JS finishes like a human pausing.
+                await self.page.wait_for_timeout(
+                    random.randint(2500, 4500))
+            except Exception as e:
+                log.warning("Prewarm step failed (continuing)",
+                            target=url, error=str(e))
+        log.info("Session prewarm complete")
 
     async def get_stamp_balances(self) -> dict[str, int]:
         """
@@ -1109,30 +1365,37 @@ class SecurusClient:
     async def purchase_stamps(
         self,
         state: str,
-        package_size: int,
+        needed: int,
         contact_name: str,
+        max_attempts: int = 15,
     ) -> StampPurchaseResult:
         """
-        Buy a stamp package for a given state by selecting a known contact.
+        Buy enough stamps to cover ``needed`` sends for *state*, by selecting a
+        known contact for that facility and choosing the smallest package on
+        the live page that meets or exceeds ``needed``.
 
-        The contact_name must already exist in the Securus contacts list
-        (added via add_contact). After selecting them, the page reveals
-        packages for that contact's facility/state.
+        Package sizes vary by facility (e.g. 6/20/35/60 vs CDCR's
+        500/1000/2000/5000), so we discover available packages dynamically
+        from the DOM after the contact is selected, rather than relying on a
+        hardcoded list.
 
-        Retries up to 3 times if clicking "Next" causes a logout.
+        The ``contact_name`` must already exist in the Securus contacts list
+        (added via ``add_contact``). Retries on logout between steps.
         """
-        pkg = next((p for p in STAMP_PACKAGES if p["size"] == package_size), None)
-        if not pkg:
+        if needed <= 0:
             return StampPurchaseResult(
-                success=False, state=state, package_size=package_size,
-                cost_usd=0, error=f"Invalid package size: {package_size}",
+                success=False, state=state, package_size=0, cost_usd=0,
+                error=f"Invalid needed count: {needed}",
             )
 
-        MAX_ATTEMPTS = 15
+        MAX_ATTEMPTS = max(1, max_attempts)
+
+        chosen_size: int = 0
+        chosen_cost: float = 0.0
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             log.info("Attempting stamp purchase",
-                     state=state, package=package_size,
+                     state=state, needed=needed,
                      contact=contact_name, attempt=attempt)
 
             try:
@@ -1160,7 +1423,7 @@ class SecurusClient:
                         await asyncio.sleep(random.uniform(3, 6))
                         continue
                     return StampPurchaseResult(
-                        success=False, state=state, package_size=package_size,
+                        success=False, state=state, package_size=0,
                         cost_usd=0,
                         error="Contact dropdown not found on Purchase page",
                         screenshot_path=ss,
@@ -1188,7 +1451,7 @@ class SecurusClient:
                         ss = await self._screenshot("stamp_contact_not_in_list")
                         return StampPurchaseResult(
                             success=False, state=state,
-                            package_size=package_size, cost_usd=0,
+                            package_size=0, cost_usd=0,
                             error=f"Contact '{contact_name}' not in dropdown",
                             screenshot_path=ss,
                         )
@@ -1197,21 +1460,75 @@ class SecurusClient:
                          contact=contact_name, state=state)
                 await self.page.wait_for_timeout(3000)
 
-                # ── Select the stamp package radio ──
-                pkg_label = f"{package_size} Stamps Package"
-                pkg_locator = self.page.locator(
-                    f"text={pkg_label}"
-                ).first
-                try:
-                    await pkg_locator.wait_for(state="visible", timeout=5000)
-                    await pkg_locator.click()
-                    log.info("Package selected", package=pkg_label)
-                except PwTimeout:
-                    radio = self.page.locator(
-                        f"input[type='radio']:near(:text('{pkg_label}'))"
+                # ── Discover the stamp packages the live page is offering ──
+                # Package sizes differ per facility (WA/OK/NY/AR: 6/20/35/60;
+                # CDCR: 500/1000/2000/5000). Scrape the visible radios and
+                # parse size/cost from each associated label.
+                discovered = await self._discover_stamp_packages()
+                if not discovered:
+                    ss = await self._screenshot("stamp_no_packages_visible")
+                    if attempt < MAX_ATTEMPTS:
+                        log.warning(
+                            "No stamp packages visible on page, retrying",
+                            attempt=attempt,
+                        )
+                        await asyncio.sleep(random.uniform(3, 6))
+                        continue
+                    return StampPurchaseResult(
+                        success=False, state=state, package_size=0,
+                        cost_usd=0,
+                        error="No stamp packages found on purchase page",
+                        screenshot_path=ss,
+                    )
+
+                # Pick the smallest package that meets demand; if even the
+                # largest falls short, fall back to the largest offered
+                # (pipeline-level daily limit will throttle further buys).
+                sorted_pkgs = sorted(discovered, key=lambda p: p["size"])
+                selected = next(
+                    (p for p in sorted_pkgs if p["size"] >= needed),
+                    sorted_pkgs[-1],
+                )
+                chosen_size = selected["size"]
+                chosen_cost = selected["cost"]
+                log.info(
+                    "Stamp package selected dynamically",
+                    state=state, needed=needed,
+                    chosen_size=chosen_size, chosen_cost=chosen_cost,
+                    offered=[p["size"] for p in sorted_pkgs],
+                )
+
+                # Click the discovered radio. Prefer clicking its <label>
+                # (bigger hit target, matches how a real user clicks), then
+                # fall back to the input itself.
+                clicked = False
+                if selected.get("radio_id"):
+                    label_loc = self.page.locator(
+                        f"label[for='{selected['radio_id']}']"
                     ).first
-                    await radio.click(timeout=5000)
-                    log.info("Package radio clicked", package=pkg_label)
+                    try:
+                        await label_loc.wait_for(state="visible", timeout=3000)
+                        await label_loc.click()
+                        clicked = True
+                    except Exception:
+                        pass
+                    if not clicked:
+                        radio_loc = self.page.locator(
+                            f"input[type='radio']#{selected['radio_id']}"
+                        ).first
+                        try:
+                            await radio_loc.click(timeout=3000)
+                            clicked = True
+                        except Exception:
+                            pass
+                if not clicked:
+                    text_loc = self.page.locator(
+                        f"text={selected['label_text']}"
+                    ).first
+                    await text_loc.click(timeout=5000)
+
+                log.info("Package radio clicked",
+                         size=chosen_size, cost=chosen_cost)
 
                 await self._human_delay()
 
@@ -1263,7 +1580,7 @@ class SecurusClient:
                             continue
                         return StampPurchaseResult(
                             success=False, state=state,
-                            package_size=package_size, cost_usd=0,
+                            package_size=chosen_size, cost_usd=0,
                             error="Buy button not found on confirmation page",
                             screenshot_path=ss,
                         )
@@ -1280,13 +1597,64 @@ class SecurusClient:
                     continue
 
                 await self._screenshot("stamp_purchase_complete")
+
+                # ── Verify Securus actually accepted the payment ──
+                # Securus does NOT change URL on failure — it just renders a
+                # red alert banner on the same page saying the bank/card
+                # rejected the charge (e.g. "We are unable to process your
+                # request. Please ensure your billing address and credit card
+                # information is correct."). Without this check the flow
+                # would silently report success and the pipeline would then
+                # think it has stamps it doesn't.
+                #
+                # We look for the distinctive phrases in visible page text.
+                # Matching is case-insensitive and bounded by what Securus
+                # actually renders; if Securus changes the copy we'll catch
+                # it on the balance delta check downstream (pipeline always
+                # re-reads balances before trusting a purchase).
+                failure_phrases = [
+                    "unable to process your request",
+                    "billing address and credit card",
+                    "contact your bank or credit card",
+                    "payment was declined",
+                    "transaction was declined",
+                    "card was declined",
+                ]
+                try:
+                    body_text = (await self.page.locator("body")
+                                 .inner_text(timeout=3000)).lower()
+                except Exception:
+                    body_text = ""
+                matched_phrase = next(
+                    (p for p in failure_phrases if p in body_text), None)
+                if matched_phrase:
+                    ss = await self._screenshot("stamp_payment_declined")
+                    log.error(
+                        "Stamp purchase declined by payment processor",
+                        state=state, package=chosen_size,
+                        cost=chosen_cost, matched_phrase=matched_phrase,
+                    )
+                    # Definitive failure — do NOT retry. Retrying a declined
+                    # card just hammers the processor and risks a hard block.
+                    return StampPurchaseResult(
+                        success=False, state=state,
+                        package_size=chosen_size, cost_usd=0,
+                        error=(
+                            f"Payment declined by Securus/processor: "
+                            f"matched='{matched_phrase}'. "
+                            "No charge went through. Check billing address "
+                            "and card on file before retrying."
+                        ),
+                        screenshot_path=ss,
+                    )
+
                 log.info("Stamp purchase successful",
-                         state=state, package=package_size,
-                         cost=pkg["cost"])
+                         state=state, package=chosen_size,
+                         cost=chosen_cost)
 
                 return StampPurchaseResult(
                     success=True, state=state,
-                    package_size=package_size, cost_usd=pkg["cost"],
+                    package_size=chosen_size, cost_usd=chosen_cost,
                 )
 
             except Exception as e:
@@ -1299,12 +1667,12 @@ class SecurusClient:
                 ss = await self._screenshot("stamp_purchase_exception")
                 return StampPurchaseResult(
                     success=False, state=state,
-                    package_size=package_size, cost_usd=0,
+                    package_size=chosen_size, cost_usd=0,
                     error=str(e), screenshot_path=ss,
                 )
 
         return StampPurchaseResult(
             success=False, state=state,
-            package_size=package_size, cost_usd=0,
+            package_size=chosen_size, cost_usd=0,
             error=f"Failed after {MAX_ATTEMPTS} attempts",
         )

@@ -21,6 +21,10 @@ data/*.json
 # Recon/debug scripts (not production)
 scrapers/ar_debug.py
 scrapers/ar_recon.py
+logout_forensics.py
+stealth_probe.py
+probe_*.py
+probe_output/
 
 # Logs
 logs/

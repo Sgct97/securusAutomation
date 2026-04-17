@@ -351,6 +351,11 @@ async def ensure_stamps(client: SecurusClient, candidates: list[dict]) -> dict:
 
     log.info("Stamp needs by state", needed=state_needed)
 
+    # Pre-warm: visit Contacts and Inbox before hitting money-moving pages.
+    # Mirrors a real user's click path and keeps ThreatMetrix from flagging
+    # us as a bot jumping straight to /stamps/*. See logout_forensics run.
+    await client.prewarm_session()
+
     balances = await client.get_stamp_balances()
     log.info("Current stamp balances", balances=balances)
     stats["checked"] = len(balances)
@@ -375,13 +380,16 @@ async def ensure_stamps(client: SecurusClient, candidates: list[dict]) -> dict:
                 break
             deficit = remaining
 
-        package = SecurusClient._pick_package(deficit)
-
         if not settings.stamp_auto_buy:
+            # Dry-run: we don't open the Securus purchase page to discover
+            # real packages, so log the deficit + the legacy-list guess for
+            # visibility only.
+            guess = SecurusClient._pick_package(deficit)
             log.info("DRY RUN: Would purchase stamps",
-                     state=state, package_size=package["size"],
-                     cost=package["cost"], deficit=deficit,
-                     current=current, needed=needed)
+                     state=state, deficit=deficit,
+                     current=current, needed=needed,
+                     guessed_package=guess["size"],
+                     guessed_cost=guess["cost"])
             continue
 
         contact_name = await _get_contact_name_for_state(state)
@@ -391,22 +399,26 @@ async def ensure_stamps(client: SecurusClient, candidates: list[dict]) -> dict:
             stats["errors"].append(f"{state}: no contact in DB")
             continue
 
+        # Packages are chosen by purchase_stamps() from the live page so we
+        # get the real sizes (6/20/35/60 vs CDCR's 500/1000/2000/5000).
         result = await client.purchase_stamps(
-            state=state, package_size=package["size"],
-            contact_name=contact_name,
+            state=state, needed=deficit, contact_name=contact_name,
         )
 
+        actual_size = result.package_size or 0
+        actual_cost = result.cost_usd or 0.0
+
         if result.success:
-            total_purchased_today += package["size"]
+            total_purchased_today += actual_size
             stats["purchased"] += 1
-            stats["total_stamps_bought"] += package["size"]
+            stats["total_stamps_bought"] += actual_size
             await _log_stamp_purchase(
-                state, package["size"], package["cost"], True)
+                state, actual_size, actual_cost, True)
         else:
             err = result.error or "Unknown error"
             stats["errors"].append(f"{state}: {err}")
             await _log_stamp_purchase(
-                state, package["size"], package["cost"], False, err)
+                state, actual_size, actual_cost, False, err)
             log.warning("Stamp purchase failed",
                         state=state, error=err)
 
