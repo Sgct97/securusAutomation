@@ -35,7 +35,12 @@ log = get_logger("add_contact_test_ok")
 FIRST_NAME = "Douglas"
 LAST_NAME  = "Simpson"
 INMATE_ID  = "0000134726"
-STATE      = "OK"
+# Production (pipeline.py) passes the FULL state name "Oklahoma" to
+# client.add_contact(), not the 2-letter code. Earlier tests used "OK"
+# and so never exercised the state-normalization path that was the real
+# root cause of 575 failed OK adds in production. Use the full name here
+# so this test reproduces the exact production call shape.
+STATE      = "Oklahoma"
 FACILITY   = "JACKIE BRANNON CORRECTIONAL CENTER"
 
 

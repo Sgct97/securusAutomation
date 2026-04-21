@@ -116,6 +116,34 @@ STATE_TO_AGENCY_HINT = {
     "AR": "arkansas doc",
 }
 
+# Securus' State dropdown uses full state names, so pipeline.py passes e.g.
+# "Oklahoma" to add_contact. But internal checks (OK leading-zero strip,
+# STATE_TO_AGENCY_HINT lookup) key off the 2-letter code. Without this
+# normalization those code paths silently never fire for any call made
+# with a full-name state, which is every production call from the pipeline.
+_STATE_FULL_TO_CODE = {
+    "oklahoma": "OK",
+    "washington": "WA",
+    "new york": "NY",
+    "california": "CA",
+    "arkansas": "AR",
+}
+
+
+def _normalize_state_code(state: str) -> str:
+    """Return the canonical 2-letter state code for *state*.
+
+    Accepts either a code ("OK") or a full name ("Oklahoma"), case-insensitive.
+    Returns uppercase code on match, otherwise the original input uppercased
+    (so unmapped states still behave like before).
+    """
+    if not state:
+        return ""
+    key = state.strip().lower()
+    if key in _STATE_FULL_TO_CODE:
+        return _STATE_FULL_TO_CODE[key]
+    return state.strip().upper()
+
 
 class SecurusClient:
     """
@@ -538,7 +566,7 @@ class SecurusClient:
                 # their native Securus format (CA "CC8032", WA "893117",
                 # AR "186001", NY "26R0001"), so we only strip for OK.
                 search_id = inmate_id
-                if state.upper() == "OK":
+                if _normalize_state_code(state) == "OK":
                     stripped = inmate_id.lstrip("0")
                     if stripped and stripped != inmate_id:
                         log.info("Stripped OK ID leading zeros",
@@ -638,7 +666,8 @@ class SecurusClient:
                     #    / "CHEROKEE COUNTY JAIL, OK"). Previously this
                     #    caused every OK add_contact to fail.
                     if not matched:
-                        hint = STATE_TO_AGENCY_HINT.get(state.upper())
+                        hint = STATE_TO_AGENCY_HINT.get(
+                            _normalize_state_code(state))
                         if hint:
                             for opt in real_opts:
                                 if hint in opt["text"].lower():
@@ -1282,6 +1311,29 @@ class SecurusClient:
             await asyncio.sleep(random.uniform(3, 6))
             await self.login()
 
+    async def _reset_to_fresh_purchase_page(self) -> None:
+        """Force a clean load of the Stamps Purchase form.
+
+        Securus' SPA keeps rendering whatever sub-view it last showed for a
+        given hash route. After a successful purchase the page is left on
+        the CONFIRMATION view of `#/products/emessage/stamps/purchase`
+        ("Your payment using a credit card ending in XXXX is complete!
+        FINISH"). A naive `goto(STAMPS_PURCHASE_URL)` right after that is a
+        no-op from the router's perspective — the URL is already current
+        and the confirmation view stays rendered, so the contact dropdown
+        we need is never created. This caused every AR stamp purchase to
+        burn all 15 retries in 2026-04-21's production run, screenshotting
+        the stale WA confirmation page each time.
+
+        We force a reset by routing through /inbox first. A different hash
+        tears down the purchase view entirely; navigating back to
+        /stamps/purchase then re-mounts a fresh form with the contact
+        dropdown populated.
+        """
+        await self._goto_or_relogin(self.EMESSAGE_INBOX_URL, max_retries=3)
+        await self.page.wait_for_timeout(1500)
+        await self._goto_or_relogin(self.STAMPS_PURCHASE_URL)
+
     async def prewarm_session(self) -> None:
         """
         Visit Contacts and Inbox before touching money-moving pages.
@@ -1402,8 +1454,15 @@ class SecurusClient:
                 await self._ensure_logged_in()
                 await self._rate_limit()
 
-                # ── Navigate to Purchase page (re-login on logout) ──
-                await self._goto_or_relogin(self.STAMPS_PURCHASE_URL)
+                # ── Navigate to a FRESH Purchase page ──
+                # Route via /inbox first so the SPA tears down any stale
+                # sub-view (e.g. the CONFIRMATION screen left over from a
+                # previous purchase in the same run). Without this, the
+                # router sees the same /stamps/purchase hash and skips
+                # re-mounting the form, leaving us on the old confirmation
+                # page with no contact dropdown. See
+                # _reset_to_fresh_purchase_page docstring.
+                await self._reset_to_fresh_purchase_page()
 
                 # ── Find the contact dropdown (the one with many options) ──
                 contact_dropdown = None
@@ -1651,6 +1710,27 @@ class SecurusClient:
                 log.info("Stamp purchase successful",
                          state=state, package=chosen_size,
                          cost=chosen_cost)
+
+                # Click FINISH to leave the confirmation view cleanly.
+                # Belt-and-suspenders: _reset_to_fresh_purchase_page on the
+                # NEXT call will handle this too, but clicking FINISH here
+                # mirrors real user behavior and avoids leaving the session
+                # parked on a payment-completion page any longer than
+                # needed. Best-effort: a failure here doesn't invalidate
+                # the successful purchase.
+                try:
+                    finish_btn = self.page.locator(
+                        "button:has-text('Finish'), "
+                        "button:has-text('FINISH'), "
+                        "a:has-text('Finish'), a:has-text('FINISH')"
+                    ).first
+                    if await finish_btn.is_visible(timeout=2000):
+                        await finish_btn.click()
+                        await self.page.wait_for_timeout(1500)
+                        log.info("Clicked FINISH on stamp confirmation")
+                except Exception as e:
+                    log.debug("FINISH click skipped (best-effort)",
+                              error=str(e))
 
                 return StampPurchaseResult(
                     success=True, state=state,
