@@ -492,6 +492,16 @@ async def send_outreach(
     client, sending messages until `send_target` is reached or all
     candidates are exhausted. Individual failures skip to the next
     candidate. Stops early only if stamps run out.
+
+    Circuit breaker: if ``CIRCUIT_BREAKER_THRESHOLD`` consecutive
+    candidates fail (contact-add or send), the loop pauses, tears down
+    the browser, re-launches it and re-logs in, then resets the streak.
+    If the breaker trips a second time in the same run we abort — at
+    that point the session is genuinely dead and burning through more
+    candidates just pollutes their retry history. This prevents the
+    2026-04-22 failure mode where one BLOCKED contact killed the
+    session and the pipeline then "failed" 91 more candidates over 13
+    hours against a dead browser.
     """
     stats = {"sent": 0, "failed": 0, "skipped": 0, "contact_errors": 0}
 
@@ -502,11 +512,51 @@ async def send_outreach(
     log.info("Starting outreach",
              pool_size=len(candidates), send_target=send_target)
 
+    consecutive_failures = 0
+    breaker_trips = 0
+    CIRCUIT_BREAKER_THRESHOLD = 5
+    MAX_BREAKER_TRIPS = 1
+    COOLDOWN_SECONDS = 60
+
     for i, candidate in enumerate(candidates, 1):
         if stats["sent"] >= send_target:
             log.info("Daily send target reached",
                      sent=stats["sent"], target=send_target)
             break
+
+        if consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
+            breaker_trips += 1
+            log.error(
+                "Circuit breaker tripped — too many consecutive failures",
+                consecutive_failures=consecutive_failures,
+                trip_number=breaker_trips,
+                remaining_candidates=len(candidates) - i + 1,
+            )
+            if breaker_trips > MAX_BREAKER_TRIPS:
+                log.error(
+                    "Circuit breaker tripped twice in one run — aborting "
+                    "outreach loop to protect remaining candidates' retry "
+                    "history. They will be picked up on the next run.",
+                    sent=stats["sent"], failed=stats["failed"],
+                )
+                break
+            try:
+                log.info("Cooling down before browser relaunch",
+                         seconds=COOLDOWN_SECONDS)
+                await asyncio.sleep(COOLDOWN_SECONDS)
+                await client.relaunch_browser()
+                client._last_action_time = 0
+                await client.login()
+                log.info("Circuit breaker recovery: relaunch+login succeeded, "
+                         "resuming outreach")
+                consecutive_failures = 0
+            except Exception as e:
+                log.error(
+                    "Circuit breaker recovery FAILED — aborting outreach loop",
+                    error=str(e),
+                    sent=stats["sent"], failed=stats["failed"],
+                )
+                break
 
         log.info(f"Processing {i}/{len(candidates)} "
                  f"(sent {stats['sent']}/{send_target})",
@@ -554,6 +604,12 @@ async def send_outreach(
                             await _mark_failed(
                                 candidate["outreach_id"], f"add_contact: {err}")
                         stats["contact_errors"] += 1
+                        # Permanent failures (inmate not on Securus, BLOCKED)
+                        # are NOT session-health signals — don't count them
+                        # against the circuit breaker. Transient failures DO
+                        # count because they often indicate a dead session.
+                        if not permanent:
+                            consecutive_failures += 1
                         continue
                     log.info("Contact already exists, proceeding to message",
                              name=candidate["name"])
@@ -571,6 +627,7 @@ async def send_outreach(
             if msg_result.success:
                 await _mark_sent(candidate["outreach_id"])
                 stats["sent"] += 1
+                consecutive_failures = 0
                 log.info("Message sent",
                          name=candidate["name"],
                          sent=stats["sent"],
@@ -590,6 +647,8 @@ async def send_outreach(
                 else:
                     await _mark_failed(candidate["outreach_id"], f"send: {err}")
                 stats["failed"] += 1
+                if not permanent:
+                    consecutive_failures += 1
                 log.warning("Failed to send, trying next",
                             name=candidate["name"], error=err,
                             permanent=permanent)
@@ -599,6 +658,8 @@ async def send_outreach(
                       name=candidate["name"], error=str(e))
             await _mark_failed(candidate["outreach_id"], str(e))
             stats["failed"] += 1
+            # Unknown exception — always a session-health signal
+            consecutive_failures += 1
 
     return stats
 

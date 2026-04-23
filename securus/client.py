@@ -220,19 +220,47 @@ class SecurusClient:
     async def close(self) -> None:
         """Shut down browser."""
         if self._page:
-            await self._page.close()
+            try:
+                await self._page.close()
+            except Exception:
+                pass
         if self._context:
-            await self._context.close()
+            try:
+                await self._context.close()
+            except Exception:
+                pass
         if self._browser:
-            await self._browser.close()
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
         if self._playwright:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
         self._page = None
         self._context = None
         self._browser = None
         self._playwright = None
         self._logged_in = False
         log.info("Browser closed")
+
+    async def relaunch_browser(self) -> None:
+        """Tear down and re-launch the browser context from scratch.
+
+        Used by the pipeline's circuit breaker when a session appears dead
+        (repeated silent logouts / TimeoutErrors). A full re-launch clears
+        Playwright's browser process, cookies, and any ThreatMetrix
+        fingerprint state tied to the previous context. The caller is
+        responsible for re-authenticating afterwards (``login()``) — we do
+        NOT auto-login here because the caller may want to wait/cool-down
+        first.
+        """
+        log.warning("Relaunching browser (circuit-breaker recovery)")
+        await self.close()
+        await self.start_browser()
+        log.info("Browser relaunched")
 
     @property
     def page(self) -> Page:
@@ -863,11 +891,26 @@ class SecurusClient:
             last_result = result
 
             err = (result.error or "").lower()
-            # Definitive: don't retry these
+            # Definitive: don't retry these. Retrying any of these just forces
+            # another re-login (see self._logged_in=False below) and burns
+            # ThreatMetrix score for no benefit.
+            #
+            # "emessaging not available at this contact's location" is the
+            # error Securus raises when the contact is present but blocked
+            # by their facility (the dropdown often shows the contact name
+            # suffixed with " - BLOCKED"). On 2026-04-22 a single BLOCKED
+            # contact (LYNDA MERCY) triggered 3 rapid re-login retries which
+            # tripped Securus' bot detection; after that point every login
+            # for the remaining 13 hours silently failed (0/857 succeeded),
+            # the pipeline flailed through 91 more candidates, and only 4
+            # of 25 targeted messages went out. Treating it as permanent
+            # costs us nothing (the contact genuinely cannot receive mail
+            # right now) and protects the session for the rest of the run.
             if any(m in err for m in (
                 "insufficient stamps at facility",
                 "contact not found in contacts dropdown",
                 "hourly message cap reached",
+                "emessaging not available",
             )):
                 return result
 
@@ -937,9 +980,13 @@ class SecurusClient:
             contact_select = self.page.locator("select#select-inmate, select[name='selectInmate']").first
             await contact_select.wait_for(state="visible", timeout=10000)
 
-            # Try exact match first, then partial
+            # Try exact match first, then partial. Capture the label of the
+            # option we actually selected so we can detect " - BLOCKED" (and
+            # similar facility-block suffixes) before attempting to compose.
+            selected_label: Optional[str] = None
             try:
                 await contact_select.select_option(label=contact_name, timeout=3000)
+                selected_label = contact_name
             except PwTimeout:
                 options = await contact_select.evaluate(
                     "sel => Array.from(sel.options).map(o => ({value: o.value, text: o.text}))"
@@ -951,6 +998,7 @@ class SecurusClient:
                         break
                 if matched:
                     await contact_select.select_option(value=matched["value"])
+                    selected_label = matched["text"]
                     log.info("Matched contact", matched=matched["text"])
                 else:
                     available = [o["text"] for o in options if o["text"] != "Select"]
@@ -963,6 +1011,28 @@ class SecurusClient:
                               f"Available: {available[:10]}",
                         screenshot_path=ss,
                     )
+
+            # Short-circuit BLOCKED contacts: Securus annotates the dropdown
+            # label with " - BLOCKED" when a contact exists but the facility
+            # has disabled eMessaging for them. Continuing to the compose
+            # form would trigger the "EMESSAGING NOT AVAILABLE" popup anyway;
+            # detecting it here skips the wasted work and returns a
+            # permanent-failure error that send_message() will NOT retry.
+            if selected_label and "BLOCKED" in selected_label.upper():
+                log.warning(
+                    "Matched contact is BLOCKED at facility; skipping send",
+                    contact_name=contact_name,
+                    matched=selected_label,
+                )
+                return MessageResult(
+                    success=False,
+                    contact_name=contact_name,
+                    subject=subject,
+                    error=(
+                        "eMessaging not available: contact is BLOCKED at "
+                        f"facility (dropdown label='{selected_label}')"
+                    ),
+                )
 
             await self._human_delay()
 
