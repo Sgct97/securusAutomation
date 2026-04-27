@@ -90,6 +90,36 @@ def _is_permanent_failure(error: str, inmate_discovered_at: Optional[datetime] =
     return False
 
 
+# Errors that indicate a *session-health* problem (dead browser, silent
+# logout, ThreatMetrix kill, page crash). Only these should count toward
+# the outreach circuit breaker. "Contact not found on Securus" is NOT
+# in this list — that's a per-inmate result, not a session signal, and
+# we may need to walk through dozens of not-found candidates before
+# finding one that's available, which is normal and expected behavior.
+SESSION_HEALTH_FAILURE_MARKERS = [
+    "timeout",                  # Locator.click / wait_for_selector timeouts
+    "page closed",              # Playwright page died
+    "page.close",               # variant
+    "context destroyed",        # browser context torn down
+    "target closed",            # underlying CDP target gone
+    "browser has been closed",  # browser process exited
+    "navigation failed",        # SPA goto failed
+    "net::err_",                # network-level chromium errors
+    "login failed",             # explicit login failure bubbled up
+    "could not log in",         # variant
+]
+
+
+def _is_session_health_failure(error: str) -> bool:
+    """True if ``error`` looks like a dead-session symptom that should
+    count against the outreach circuit breaker. Per-inmate "not found"
+    results are explicitly NOT considered session-health failures."""
+    if not error:
+        return False
+    err_lower = error.lower()
+    return any(marker in err_lower for marker in SESSION_HEALTH_FAILURE_MARKERS)
+
+
 def _is_excluded_facility(facility: Optional[str]) -> bool:
     """True if the facility matches a keyword indicating it's NOT on
     Securus eMessaging (e.g. county-jail waiting lists)."""
@@ -515,7 +545,7 @@ async def send_outreach(
     consecutive_failures = 0
     breaker_trips = 0
     CIRCUIT_BREAKER_THRESHOLD = 5
-    MAX_BREAKER_TRIPS = 1
+    MAX_BREAKER_TRIPS = 2
     COOLDOWN_SECONDS = 60
 
     for i, candidate in enumerate(candidates, 1):
@@ -604,12 +634,17 @@ async def send_outreach(
                             await _mark_failed(
                                 candidate["outreach_id"], f"add_contact: {err}")
                         stats["contact_errors"] += 1
-                        # Permanent failures (inmate not on Securus, BLOCKED)
-                        # are NOT session-health signals — don't count them
-                        # against the circuit breaker. Transient failures DO
-                        # count because they often indicate a dead session.
-                        if not permanent:
+                        # Only session-health symptoms (timeouts, dead
+                        # browser, login failures) count against the
+                        # circuit breaker. "Contact not found on Securus"
+                        # is a normal per-inmate outcome and may legitimately
+                        # repeat for many candidates in a row before we hit
+                        # a findable one — counting those would prematurely
+                        # abort the run.
+                        if _is_session_health_failure(err):
                             consecutive_failures += 1
+                        else:
+                            consecutive_failures = 0
                         continue
                     log.info("Contact already exists, proceeding to message",
                              name=candidate["name"])
@@ -647,8 +682,10 @@ async def send_outreach(
                 else:
                     await _mark_failed(candidate["outreach_id"], f"send: {err}")
                 stats["failed"] += 1
-                if not permanent:
+                if _is_session_health_failure(err):
                     consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
                 log.warning("Failed to send, trying next",
                             name=candidate["name"], error=err,
                             permanent=permanent)
