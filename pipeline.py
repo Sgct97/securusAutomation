@@ -131,6 +131,54 @@ def _is_excluded_facility(facility: Optional[str]) -> bool:
     return any(kw in fac_lower for kw in keywords)
 
 
+# Generational suffixes that should never be treated as a last name.
+# Production data (the OK bulk extract in particular) flattens
+# "FIRST MIDDLE LAST SUFFIX" into a single space-separated string, and
+# the previous splitter naively took parts[-1] as the last name. That
+# produced "first=LEONARD last=JR" for "LEONARD ADRIAN CLIFTON JR" and
+# every Securus contact search for OK suffixed names returned zero
+# results. Strip the suffix BEFORE picking the last name.
+_NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V", "VI"}
+
+
+def _split_inmate_name(full_name: str) -> tuple[str, str]:
+    """Split a stored inmate name into (first_name, last_name) for use
+    against the Securus contact-search form.
+
+    Handles three real-world layouts:
+    - "LAST, FIRST MIDDLE" (NY/WA scrapers) -> first=FIRST, last=LAST
+    - "FIRST MIDDLE LAST [SUFFIX]" (OK bulk parser, after suffix strip)
+    - "FIRST LAST" (the trivial case)
+
+    Returns ("", "") for an empty / whitespace-only input.
+    """
+    if not full_name:
+        return "", ""
+
+    if "," in full_name:
+        last_part, _, rest = full_name.partition(",")
+        last_name = last_part.strip()
+        rest_tokens = rest.strip().split()
+        first_name = rest_tokens[0] if rest_tokens else ""
+        return first_name, last_name
+
+    tokens = full_name.strip().split()
+    if not tokens:
+        return "", ""
+    if len(tokens) == 1:
+        return tokens[0], ""
+
+    # Strip trailing suffix tokens (JR, SR, III, etc.) so the *real*
+    # last name ends up at tokens[-1]. Suffix comparison is upper-case
+    # because production names are stored upper-case throughout.
+    while len(tokens) > 1 and tokens[-1].upper().rstrip(".") in _NAME_SUFFIXES:
+        tokens.pop()
+
+    if len(tokens) == 1:
+        return tokens[0], ""
+    return tokens[0], tokens[-1]
+
+
 # =========================================================================
 # STEP 1: SCRAPING
 # =========================================================================
@@ -324,14 +372,7 @@ async def get_pending_candidates(limit: int) -> list[dict]:
                     filtered_stats["excluded_facility"] += 1
                     continue
 
-                name_parts = inmate.name.split(",", 1)
-                if len(name_parts) == 2:
-                    last_name = name_parts[0].strip()
-                    first_name = name_parts[1].strip().split()[0]
-                else:
-                    parts = inmate.name.strip().split()
-                    first_name = parts[0] if parts else ""
-                    last_name = parts[-1] if len(parts) > 1 else ""
+                first_name, last_name = _split_inmate_name(inmate.name)
 
                 candidates.append({
                     "outreach_id": record.id,
@@ -497,17 +538,8 @@ async def _get_contact_name_for_state(state: str) -> str | None:
     if not inmate:
         return None
 
-    # Parse "LAST, FIRST MIDDLE" → "FIRST LAST" (Securus dropdown format)
-    parts = inmate.name.split(",", 1)
-    if len(parts) == 2:
-        last = parts[0].strip()
-        first = parts[1].strip().split()[0]
-    else:
-        tokens = inmate.name.strip().split()
-        first = tokens[0] if tokens else ""
-        last = tokens[-1] if len(tokens) > 1 else ""
-
-    return f"{first} {last}".upper()
+    first, last = _split_inmate_name(inmate.name)
+    return f"{first} {last}".upper().strip()
 
 
 # =========================================================================
@@ -548,6 +580,16 @@ async def send_outreach(
     MAX_BREAKER_TRIPS = 2
     COOLDOWN_SECONDS = 60
 
+    # Track states whose stamps ran out mid-run. Once we get a single
+    # "insufficient stamps" hit for state X, every remaining X candidate
+    # is guaranteed to fail the same way (the deficit isn't going to
+    # disappear without a stamp purchase, which we can't do mid-loop
+    # because the contact_name lookup needs a CONTACT_ADDED record we
+    # don't have yet for new states). Skipping the rest of state X for
+    # this run prevents the wasted-attempts pattern seen on 2026-04-28
+    # where 15 OK candidates each ate ~8 minutes hitting the same modal.
+    out_of_stamps_states: set[str] = set()
+
     for i, candidate in enumerate(candidates, 1):
         if stats["sent"] >= send_target:
             log.info("Daily send target reached",
@@ -587,6 +629,12 @@ async def send_outreach(
                     sent=stats["sent"], failed=stats["failed"],
                 )
                 break
+
+        if candidate["state"] in out_of_stamps_states:
+            log.debug("Skipping candidate; state is out of stamps for this run",
+                      name=candidate["name"], state=candidate["state"])
+            stats["skipped"] += 1
+            continue
 
         log.info(f"Processing {i}/{len(candidates)} "
                  f"(sent {stats['sent']}/{send_target})",
@@ -669,7 +717,34 @@ async def send_outreach(
                          target=send_target)
             else:
                 err = msg_result.error or "Unknown error"
-                if "stamp" in err.lower() and ("0" in err or "no" in err.lower()):
+                err_lower = err.lower()
+                # Detect insufficient-stamps for the CURRENT candidate's
+                # state. Securus' modal text starts with "Insufficient
+                # stamps at facility:" so we match on that. Mark the
+                # state as out-of-stamps so subsequent candidates from
+                # the same state are skipped for the rest of the run
+                # (see out_of_stamps_states above for rationale).
+                if "insufficient stamps" in err_lower:
+                    state_code = candidate["state"]
+                    if state_code not in out_of_stamps_states:
+                        log.warning(
+                            "Insufficient stamps for state; "
+                            "skipping remaining candidates from this state "
+                            "for the rest of this run",
+                            state=state_code,
+                            remaining_in_state=sum(
+                                1 for c in candidates[i:]
+                                if c["state"] == state_code
+                            ),
+                        )
+                        out_of_stamps_states.add(state_code)
+                    await _mark_failed(candidate["outreach_id"], f"send: {err}")
+                    stats["failed"] += 1
+                    consecutive_failures = 0  # Not a session signal.
+                    continue
+                # Legacy "out of stamps, stop run entirely" fallback
+                # for the global zero-stamps modal. Kept for safety.
+                if "stamp" in err_lower and ("0" in err or "no" in err_lower):
                     log.warning("Out of stamps, stopping run", error=err)
                     await _mark_failed(candidate["outreach_id"], f"send: {err}")
                     stats["failed"] += 1
