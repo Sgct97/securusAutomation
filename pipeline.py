@@ -333,6 +333,24 @@ async def get_pending_candidates(limit: int) -> list[dict]:
 
     candidates = []
     filtered_stats = {"excluded_facility": 0, "too_fresh": 0}
+    backfill_stats: dict[str, int] = {}
+
+    def _build_candidate(record: OutreachRecord, inmate: Inmate) -> dict:
+        first_name, last_name = _split_inmate_name(inmate.name)
+        return {
+            "outreach_id": record.id,
+            "outreach_status": record.status,
+            "inmate_db_id": inmate.id,
+            "inmate_id": inmate.inmate_id,
+            "name": inmate.name,
+            "first_name": first_name,
+            "last_name": last_name,
+            "state": inmate.state,
+            "state_full": STATE_ABBR_TO_FULL.get(inmate.state, inmate.state),
+            "facility": inmate.facility or "",
+            "agency": STATE_TO_AGENCY.get(inmate.state, ""),
+            "discovered_at": inmate.discovered_at,
+        }
 
     async with async_session_factory() as session:
         for i, state in enumerate(states):
@@ -342,7 +360,10 @@ async def get_pending_candidates(limit: int) -> list[dict]:
             # still hit state_limit.
             raw_limit = state_limit * 3
 
-            result = await session.execute(
+            # ----- Pass 1: fresh, recently-discovered inmates -----
+            # Prefer recent inductees because they are more likely to be
+            # findable on Securus and not yet exhausted by the queue.
+            fresh_result = await session.execute(
                 select(OutreachRecord, Inmate)
                 .join(Inmate)
                 .where(
@@ -364,36 +385,71 @@ async def get_pending_candidates(limit: int) -> list[dict]:
             )
 
             kept_for_state = 0
-            for record, inmate in result.all():
+            kept_outreach_ids: set[int] = set()
+            for record, inmate in fresh_result.all():
                 if kept_for_state >= state_limit:
                     break
-
                 if _is_excluded_facility(inmate.facility):
                     filtered_stats["excluded_facility"] += 1
                     continue
-
-                first_name, last_name = _split_inmate_name(inmate.name)
-
-                candidates.append({
-                    "outreach_id": record.id,
-                    "outreach_status": record.status,
-                    "inmate_db_id": inmate.id,
-                    "inmate_id": inmate.inmate_id,
-                    "name": inmate.name,
-                    "first_name": first_name,
-                    "last_name": last_name,
-                    "state": inmate.state,
-                    "state_full": STATE_ABBR_TO_FULL.get(inmate.state, inmate.state),
-                    "facility": inmate.facility or "",
-                    "agency": STATE_TO_AGENCY.get(inmate.state, ""),
-                    "discovered_at": inmate.discovered_at,
-                })
+                candidates.append(_build_candidate(record, inmate))
+                kept_outreach_ids.add(record.id)
                 kept_for_state += 1
+
+            # ----- Pass 2: backfill with oldest untried inmates -----
+            # If the freshness filter didn't yield enough candidates for
+            # this state (scraper stalled, freshness window too tight, or
+            # state has only old inmates in the pool), top up with the
+            # OLDEST never-attempted records. Soft preference, not hard
+            # requirement: WA still gets fresh-first because its scraper
+            # produces fresh inmates; OK/AR/NY/CA degrade gracefully.
+            if kept_for_state < state_limit:
+                deficit = state_limit * 3  # raw pool for post-filter slack
+                backfill_filters = [
+                    Inmate.state == state,
+                    OutreachRecord.status.in_([
+                        OutreachStatus.PENDING.value,
+                        OutreachStatus.CONTACT_ADDED.value,
+                    ]),
+                    OutreachRecord.retry_count < MAX_RETRIES,
+                    ~Inmate.name.like("UNKNOWN%"),
+                    or_(
+                        OutreachRecord.next_retry_at == None,
+                        OutreachRecord.next_retry_at <= datetime.now(timezone.utc),
+                    ),
+                ]
+                if kept_outreach_ids:
+                    backfill_filters.append(
+                        ~OutreachRecord.id.in_(kept_outreach_ids)
+                    )
+
+                backfill_result = await session.execute(
+                    select(OutreachRecord, Inmate)
+                    .join(Inmate)
+                    .where(*backfill_filters)
+                    .order_by(Inmate.discovered_at.asc())
+                    .limit(deficit)
+                )
+
+                added_via_backfill = 0
+                for record, inmate in backfill_result.all():
+                    if kept_for_state >= state_limit:
+                        break
+                    if _is_excluded_facility(inmate.facility):
+                        filtered_stats["excluded_facility"] += 1
+                        continue
+                    candidates.append(_build_candidate(record, inmate))
+                    kept_for_state += 1
+                    added_via_backfill += 1
+
+                if added_via_backfill:
+                    backfill_stats[state] = added_via_backfill
 
     log.info("Candidate pool loaded",
              pool_size=len(candidates), send_target=limit,
              induction_lag_days=settings.induction_lag_days,
              filtered=filtered_stats,
+             backfilled=backfill_stats,
              by_state={s: sum(1 for c in candidates if c["state"] == s) for s in states})
     return candidates
 
@@ -840,6 +896,82 @@ async def _mark_failed(outreach_id: int, error: str):
         await session.commit()
 
 
+# Records whose only failure was a session-health symptom (timeouts,
+# logouts, ThreatMetrix kills) get a second chance after this window.
+# Genuine "Contact not found on Securus" failures are NOT re-queued —
+# those represent real Securus answers and should stay FAILED.
+SESSION_FAILURE_RETRY_DAYS = 7
+
+
+async def _requeue_stale_session_failures() -> int:
+    """Move FAILED records back to PENDING when their failure looks like a
+    transient session-health symptom (timeout / logout / page crash) and
+    they last ran more than ``SESSION_FAILURE_RETRY_DAYS`` days ago.
+
+    Returns the number of records re-queued. Resets ``retry_count`` to 0
+    and clears ``next_retry_at`` so the standard selection logic picks
+    them up immediately. Per-state counts are logged for observability.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=SESSION_FAILURE_RETRY_DAYS)
+
+    err_lower = func.lower(OutreachRecord.error_message)
+    session_marker_filter = or_(*[
+        err_lower.like(f"%{marker}%") for marker in SESSION_HEALTH_FAILURE_MARKERS
+    ])
+
+    async with async_session_factory() as session:
+        # Per-state count *before* the update for observability
+        per_state = (await session.execute(
+            select(Inmate.state, func.count(OutreachRecord.id))
+            .select_from(OutreachRecord)
+            .join(Inmate, Inmate.id == OutreachRecord.inmate_id)
+            .where(
+                OutreachRecord.status == OutreachStatus.FAILED.value,
+                OutreachRecord.next_retry_at < cutoff,
+                session_marker_filter,
+            )
+            .group_by(Inmate.state)
+        )).all()
+
+        if not per_state:
+            log.info("No stale session-failure records to re-queue")
+            return 0
+
+        # Collect ids in a separate query so we can scope the UPDATE to
+        # exactly the rows we just counted (SQLite has no UPDATE...JOIN).
+        ids_result = await session.execute(
+            select(OutreachRecord.id)
+            .select_from(OutreachRecord)
+            .join(Inmate, Inmate.id == OutreachRecord.inmate_id)
+            .where(
+                OutreachRecord.status == OutreachStatus.FAILED.value,
+                OutreachRecord.next_retry_at < cutoff,
+                session_marker_filter,
+            )
+        )
+        ids = [r[0] for r in ids_result.all()]
+
+        await session.execute(
+            update(OutreachRecord)
+            .where(OutreachRecord.id.in_(ids))
+            .values(
+                status=OutreachStatus.PENDING.value,
+                retry_count=0,
+                next_retry_at=None,
+            )
+        )
+        await session.commit()
+
+    total = sum(c for _, c in per_state)
+    log.info(
+        "Re-queued stale session-failure records",
+        total=total,
+        by_state={state: count for state, count in per_state},
+        cutoff_days=SESSION_FAILURE_RETRY_DAYS,
+    )
+    return total
+
+
 async def _mark_permanently_failed(outreach_id: int, error: str):
     """For errors that will never succeed on retry (inmate not on Securus, etc.)."""
     async with async_session_factory() as session:
@@ -885,6 +1017,10 @@ async def run_pipeline():
 
     # Step 2: Create outreach records for any new inmates
     await create_outreach_for_new_inmates()
+
+    # Step 2.5: Re-queue stale session-health failures so we get a second
+    # crack at inmates that only failed because the browser died last time.
+    await _requeue_stale_session_failures()
 
     # Step 3: Get pending candidates
     candidates = await get_pending_candidates(settings.daily_message_limit)
