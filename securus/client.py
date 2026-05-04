@@ -535,7 +535,13 @@ class SecurusClient:
             if attempt < max_attempts:
                 log.warning("add_contact transient failure, retrying",
                             attempt=attempt, error=result.error)
-                self._logged_in = False  # force re-login on next goto
+                # Don't force re-login here. _ensure_logged_in() at the
+                # start of the next attempt will detect a real logout
+                # (URL on /login) and re-auth then. Forcing re-login on
+                # every transient UI hiccup (button covered by overlay,
+                # slow XHR, stale element) caused 24+ logins per run on
+                # 2026-05-03, which is exactly the rapid-login pattern
+                # ThreatMetrix flags as bot behavior.
                 await asyncio.sleep(random.uniform(3, 6))
 
         return last_result or ContactResult(
@@ -917,7 +923,10 @@ class SecurusClient:
             if attempt < max_attempts:
                 log.warning("send_message transient failure, retrying",
                             attempt=attempt, error=result.error)
-                self._logged_in = False  # force re-login on next goto
+                # See add_contact comment: _ensure_logged_in() will
+                # re-auth on the next attempt only if the page is
+                # genuinely on /login. Avoid the unconditional re-login
+                # that drove rapid-login churn on 2026-05-03.
                 await asyncio.sleep(random.uniform(3, 6))
 
         return last_result or MessageResult(
