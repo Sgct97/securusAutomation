@@ -162,6 +162,23 @@ async def save_progress(last_num: int, total: int, prefix: str = "CC",
         await session.commit()
 
 
+async def load_progress() -> tuple[Optional[str], Optional[int]]:
+    """Return the last saved (prefix, sequence) cursor, or (None, None)
+    if no saved state exists. Used so subsequent runs pick up where
+    the previous one left off rather than restarting at the hardcoded
+    default (which had been re-checking the same ~15 IDs since
+    whenever 7920 was first set).
+    """
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(ScrapeProgress).where(ScrapeProgress.state == "CA")
+        )
+        progress = result.scalar_one_or_none()
+        if not progress:
+            return None, None
+        return progress.last_letter, progress.last_page
+
+
 async def load_inmate_to_db(rec: dict):
     async with async_session_factory() as session:
         existing = await session.execute(
@@ -188,29 +205,142 @@ async def load_inmate_to_db(rec: dict):
         return True
 
 
+CA_PREFIXES = ["CC", "WH"]
+# Per-prefix default starting sequence to use the *first* time we ever
+# scan a prefix. After that the saved cursor takes over.
+CA_PREFIX_DEFAULT_STARTS = {"CC": 7920, "WH": 1}
+
+
+async def _scan_prefix(
+    page,
+    prefix: str,
+    start_num: int,
+    budget: int,
+    stop_after_misses: int,
+) -> tuple[int, int, int]:
+    """Scan a single CDCR# prefix starting at *start_num*.
+
+    Stops when ``stop_after_misses`` consecutive not-found is hit, or
+    ``budget`` numbers have been checked. Returns
+    ``(checked, found_new, last_num_checked)`` so the caller can update
+    progress and decide how much of the global budget remains.
+    """
+    checked = 0
+    found_new = 0
+    consecutive_misses = 0
+    current_num = start_num
+
+    for _ in range(budget):
+        cdcr_num = f"{prefix}{current_num}"
+        log.info("Searching CDCR#", cdcr=cdcr_num)
+        checked += 1
+
+        try:
+            result = await search_cdcr(page, cdcr_num)
+            if result:
+                log.info("Found inmate",
+                         cdcr=cdcr_num, name=result["name"])
+                is_new = await load_inmate_to_db(result)
+                if is_new:
+                    found_new += 1
+                consecutive_misses = 0
+            else:
+                log.info("CDCR# not found (gap)", cdcr=cdcr_num)
+                consecutive_misses += 1
+                if consecutive_misses >= stop_after_misses:
+                    log.info(
+                        "Too many consecutive gaps for prefix - stopping",
+                        prefix=prefix, misses=consecutive_misses,
+                    )
+                    break
+        except Exception as e:
+            log.error("Error searching CDCR#", cdcr=cdcr_num, error=str(e))
+            consecutive_misses += 1
+
+        # Persist after every probe so we can resume mid-prefix on crash.
+        await save_progress(current_num, found_new, prefix)
+
+        # Navigate back via "RETURN TO SEARCH" link or URL
+        return_link = await page.query_selector('a:has-text("RETURN TO SEARCH")')
+        if return_link:
+            await return_link.click()
+            await page.wait_for_timeout(1500)
+        else:
+            await page.goto(CA_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2000)
+            await dismiss_popup_and_agree(page)
+        await select_cdcr_radio(page)
+
+        # Rate limit
+        delay = settings.scraper_request_delay
+        await page.wait_for_timeout(int(delay * 1000))
+
+        current_num += 1
+
+    # current_num is now one PAST the last one we checked; subtract for return
+    last_checked = current_num - 1 if checked else start_num - 1
+    return checked, found_new, last_checked
+
+
 async def run(
-    prefix: str = "CC",
-    start_num: int = 7920,
+    prefix: Optional[str] = None,
+    start_num: Optional[int] = None,
     max_count: int = 50,
     stop_after_misses: int = 10,
 ):
     """
-    Enumerate CDCR numbers and scrape inmate data.
+    Enumerate CDCR numbers across all configured prefixes.
 
     Args:
-        prefix: CDCR# prefix (CC for men, WH for women)
-        start_num: Starting sequence number
-        max_count: Max numbers to check
-        stop_after_misses: Stop after N consecutive not-found (higher than NY due to gaps)
+        prefix: If given, scan only this prefix. If None, resume from
+            saved progress and rotate through ``CA_PREFIXES`` (CC, WH).
+        start_num: Starting sequence number. If None, resume from saved
+            progress, falling back to ``CA_PREFIX_DEFAULT_STARTS`` for
+            prefixes never scanned before.
+        max_count: GLOBAL budget of numbers to check across all prefixes
+            this run. Once hit, the run stops.
+        stop_after_misses: Per-prefix, stop scanning that prefix after
+            this many consecutive not-found responses (higher than NY
+            because CDCR# space has ~15-20% gaps). The next prefix is
+            then tried with whatever budget remains.
+
+    Resumption: The original implementation always restarted at the
+    hardcoded ``prefix="CC", start_num=7920`` and never looked at WH
+    (women) at all. Now we read ``ScrapeProgress`` and pick up where
+    we left off, then rotate to the next prefix when CC runs dry.
     """
     await init_db()
 
-    log.info("California CDCR scraper starting",
-             prefix=prefix, start=start_num, max_count=max_count)
+    saved_prefix, saved_num = await load_progress()
 
+    if prefix is not None:
+        prefixes_to_scan = [prefix]
+        per_prefix_starts = {
+            prefix: start_num if start_num is not None else (
+                CA_PREFIX_DEFAULT_STARTS.get(prefix, 1)
+            )
+        }
+    else:
+        prefixes_to_scan = list(CA_PREFIXES)
+        if saved_prefix and saved_prefix in prefixes_to_scan:
+            idx = prefixes_to_scan.index(saved_prefix)
+            prefixes_to_scan = prefixes_to_scan[idx:] + prefixes_to_scan[:idx]
+        per_prefix_starts = {}
+        for pfx in prefixes_to_scan:
+            if pfx == saved_prefix and saved_num:
+                per_prefix_starts[pfx] = saved_num + 1
+            else:
+                per_prefix_starts[pfx] = CA_PREFIX_DEFAULT_STARTS.get(pfx, 1)
+
+    log.info("California CDCR scraper starting",
+             prefixes_to_scan=prefixes_to_scan,
+             per_prefix_starts=per_prefix_starts,
+             max_count=max_count)
+
+    total_checked = 0
     found_total = 0
-    consecutive_misses = 0
-    current_num = start_num
+    last_prefix_scanned = prefixes_to_scan[0]
+    last_num_scanned = per_prefix_starts[last_prefix_scanned] - 1
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -239,56 +369,40 @@ async def run(
         await dismiss_popup_and_agree(page)
         await select_cdcr_radio(page)
 
-        for i in range(max_count):
-            cdcr_num = f"{prefix}{current_num}"
-            log.info("Searching CDCR#", cdcr=cdcr_num, progress=f"{i+1}/{max_count}")
+        for current_prefix in prefixes_to_scan:
+            remaining = max_count - total_checked
+            if remaining <= 0:
+                log.info("Global CDCR# budget exhausted, stopping")
+                break
 
-            try:
-                result = await search_cdcr(page, cdcr_num)
+            prefix_start = per_prefix_starts[current_prefix]
+            log.info("Scanning prefix",
+                     prefix=current_prefix, start=prefix_start,
+                     budget=remaining)
 
-                if result:
-                    log.info("Found inmate",
-                             cdcr=cdcr_num, name=result["name"])
-                    is_new = await load_inmate_to_db(result)
-                    if is_new:
-                        found_total += 1
-                    consecutive_misses = 0
-                else:
-                    log.info("CDCR# not found (gap)", cdcr=cdcr_num)
-                    consecutive_misses += 1
+            checked, found, last_num = await _scan_prefix(
+                page=page, prefix=current_prefix,
+                start_num=prefix_start, budget=remaining,
+                stop_after_misses=stop_after_misses,
+            )
+            total_checked += checked
+            found_total += found
+            last_prefix_scanned = current_prefix
+            last_num_scanned = last_num
 
-                    if consecutive_misses >= stop_after_misses:
-                        log.info("Too many consecutive gaps — likely reached end",
-                                 misses=consecutive_misses)
-                        break
-
-            except Exception as e:
-                log.error("Error searching CDCR#", cdcr=cdcr_num, error=str(e))
-                consecutive_misses += 1
-
-            current_num += 1
-            await save_progress(current_num, found_total, prefix)
-
-            # Navigate back via "RETURN TO SEARCH" link or URL
-            return_link = await page.query_selector('a:has-text("RETURN TO SEARCH")')
-            if return_link:
-                await return_link.click()
-                await page.wait_for_timeout(1500)
-            else:
-                await page.goto(CA_URL, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(2000)
-                await dismiss_popup_and_agree(page)
-            await select_cdcr_radio(page)
-
-            # Rate limit
-            delay = settings.scraper_request_delay
-            await page.wait_for_timeout(int(delay * 1000))
+            log.info("Prefix scan complete",
+                     prefix=current_prefix, checked=checked,
+                     found_new=found, last_num=last_num)
 
         await browser.close()
 
-    await save_progress(current_num, found_total, prefix, status="completed")
+    await save_progress(
+        last_num_scanned, found_total, last_prefix_scanned,
+        status="completed",
+    )
     log.info("California scraper complete",
-             found=found_total, last_num=current_num)
+             found=found_total, total_checked=total_checked,
+             last_prefix=last_prefix_scanned, last_num=last_num_scanned)
     return found_total
 
 

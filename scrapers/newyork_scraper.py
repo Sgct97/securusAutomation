@@ -146,6 +146,21 @@ async def save_progress(last_letter: str, last_num: int, total: int, status: str
         await session.commit()
 
 
+async def load_progress() -> tuple[Optional[str], Optional[int]]:
+    """Return the last saved (letter, sequence) cursor, or (None, None)
+    if no saved state exists. Used so subsequent runs pick up where the
+    previous one left off instead of restarting at letter R sequence 1.
+    """
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(ScrapeProgress).where(ScrapeProgress.state == "NY")
+        )
+        progress = result.scalar_one_or_none()
+        if not progress:
+            return None, None
+        return progress.last_letter, progress.last_page
+
+
 async def load_inmate_to_db(rec: dict):
     async with async_session_factory() as session:
         existing = await session.execute(
@@ -172,30 +187,126 @@ async def load_inmate_to_db(rec: dict):
         return True
 
 
+async def _scan_letter(
+    page,
+    year: int,
+    letter: str,
+    start_num: int,
+    budget: int,
+    stop_after_misses: int,
+) -> tuple[int, int, int]:
+    """Scan a single reception-center letter starting at *start_num*.
+
+    Stops when ``stop_after_misses`` consecutive not-found is hit, or
+    ``budget`` DINs have been checked (whichever comes first). Returns
+    ``(checked, found_new, last_seq_checked)`` so the caller can update
+    progress and decide how much of the global budget remains.
+    """
+    checked = 0
+    found_new = 0
+    consecutive_misses = 0
+    last_seq = start_num - 1
+
+    for i in range(start_num, start_num + budget):
+        din = f"{year:02d}{letter}{i:04d}"
+        log.info("Searching DIN", din=din)
+        last_seq = i
+        checked += 1
+
+        try:
+            result = await search_din(page, din)
+
+            if result:
+                log.info("Found inmate",
+                         din=din, name=result["name"],
+                         facility=result.get("facility"))
+                is_new = await load_inmate_to_db(result)
+                if is_new:
+                    found_new += 1
+                consecutive_misses = 0
+            else:
+                log.info("DIN not found", din=din)
+                consecutive_misses += 1
+                if consecutive_misses >= stop_after_misses:
+                    log.info("Reached end of sequence for letter",
+                             letter=letter, misses=consecutive_misses,
+                             last_din=din)
+                    break
+        except Exception as e:
+            log.error("Error searching DIN", din=din, error=str(e))
+            consecutive_misses += 1
+
+        # Persist after every probe so we can resume mid-letter on crash.
+        await save_progress(letter, i, found_new)
+
+        # Rate limit
+        delay = settings.scraper_request_delay
+        await page.wait_for_timeout(int(delay * 1000))
+
+    return checked, found_new, last_seq
+
+
 async def run(
     year: int = 26,
-    letter: str = "R",
-    start_num: int = 1,
+    letter: Optional[str] = None,
+    start_num: Optional[int] = None,
     max_count: int = 50,
     stop_after_misses: int = 5,
 ):
     """
-    Enumerate DINs and scrape inmate data.
+    Enumerate DINs across all reception center letters and scrape data.
 
     Args:
-        year: 2-digit reception year (26 = 2026)
-        letter: Reception center letter
-        start_num: Starting sequence number
-        max_count: Max DINs to check
-        stop_after_misses: Stop after this many consecutive not-found results
+        year: 2-digit reception year (26 = 2026).
+        letter: If given, scan only this reception-center letter.
+            If None, resume from saved progress and rotate through
+            ``RECEPTION_CENTERS`` (R, A, B, G).
+        start_num: Starting sequence number. If None, resume from
+            saved progress (or 1 for letters with no prior progress).
+        max_count: GLOBAL budget of DINs to check across all letters
+            this run. Once hit, the run stops even if a letter still
+            has more numbers to scan.
+        stop_after_misses: Per-letter, stop scanning that letter after
+            this many consecutive not-found responses. The next letter
+            is then tried with whatever budget remains.
+
+    Resumption: The original implementation always restarted at
+    ``letter="R", start_num=1`` and never even tried letters A, B, G.
+    Now we read ``ScrapeProgress`` and pick up where we left off, then
+    rotate to the next letter when the current one runs dry.
     """
     await init_db()
 
-    log.info("New York DOCCS scraper starting",
-             year=year, letter=letter, start=start_num, max_count=max_count)
+    saved_letter, saved_num = await load_progress()
 
+    # Letters to scan this run, in order. If a specific letter was
+    # passed, scan just that one. Otherwise rotate through the canonical
+    # reception centers, starting at the saved letter so we resume.
+    if letter is not None:
+        letters_to_scan = [letter]
+        per_letter_starts = {letter: start_num if start_num is not None else 1}
+    else:
+        letters_to_scan = list(RECEPTION_CENTERS)
+        if saved_letter and saved_letter in letters_to_scan:
+            # Rotate so saved letter is first.
+            idx = letters_to_scan.index(saved_letter)
+            letters_to_scan = letters_to_scan[idx:] + letters_to_scan[:idx]
+        per_letter_starts = {}
+        for letter_iter in letters_to_scan:
+            if letter_iter == saved_letter and saved_num:
+                per_letter_starts[letter_iter] = saved_num + 1
+            else:
+                per_letter_starts[letter_iter] = 1
+
+    log.info("New York DOCCS scraper starting",
+             year=year, letters_to_scan=letters_to_scan,
+             per_letter_starts=per_letter_starts,
+             max_count=max_count)
+
+    total_checked = 0
     found_total = 0
-    consecutive_misses = 0
+    last_letter_scanned = letters_to_scan[0]
+    last_seq_scanned = per_letter_starts[last_letter_scanned] - 1
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -218,46 +329,39 @@ async def run(
             await stealth_async(page)
         page.set_default_timeout(15000)
 
-        for i in range(start_num, start_num + max_count):
-            din = f"{year:02d}{letter}{i:04d}"
-            log.info("Searching DIN", din=din)
+        for current_letter in letters_to_scan:
+            remaining = max_count - total_checked
+            if remaining <= 0:
+                log.info("Global DIN budget exhausted, stopping")
+                break
 
-            try:
-                result = await search_din(page, din)
+            letter_start = per_letter_starts[current_letter]
+            log.info("Scanning reception-center letter",
+                     letter=current_letter, start=letter_start,
+                     budget=remaining)
 
-                if result:
-                    log.info("Found inmate",
-                             din=din, name=result["name"],
-                             facility=result.get("facility"))
-                    is_new = await load_inmate_to_db(result)
-                    if is_new:
-                        found_total += 1
-                    consecutive_misses = 0
-                else:
-                    log.info("DIN not found", din=din)
-                    consecutive_misses += 1
+            checked, found, last_seq = await _scan_letter(
+                page=page, year=year, letter=current_letter,
+                start_num=letter_start, budget=remaining,
+                stop_after_misses=stop_after_misses,
+            )
+            total_checked += checked
+            found_total += found
+            last_letter_scanned = current_letter
+            last_seq_scanned = last_seq
 
-                    if consecutive_misses >= stop_after_misses:
-                        log.info("Reached end of sequence",
-                                 misses=consecutive_misses,
-                                 last_din=din)
-                        break
-
-            except Exception as e:
-                log.error("Error searching DIN", din=din, error=str(e))
-                consecutive_misses += 1
-
-            await save_progress(letter, i, found_total)
-
-            # Rate limit
-            delay = settings.scraper_request_delay
-            await page.wait_for_timeout(int(delay * 1000))
+            log.info("Letter scan complete",
+                     letter=current_letter, checked=checked,
+                     found_new=found, last_seq=last_seq)
 
         await browser.close()
 
-    await save_progress(letter, i, found_total, status="completed")
+    await save_progress(
+        last_letter_scanned, last_seq_scanned, found_total, status="completed",
+    )
     log.info("New York scraper complete",
-             found=found_total, last_sequence=i)
+             found=found_total, total_checked=total_checked,
+             last_letter=last_letter_scanned, last_seq=last_seq_scanned)
     return found_total
 
 
