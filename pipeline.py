@@ -530,10 +530,26 @@ async def ensure_stamps(client: SecurusClient, candidates: list[dict]) -> dict:
 
         contact_name = await _get_contact_name_for_state(state)
         if not contact_name:
-            log.warning("No known contact for state, cannot buy stamps",
-                        state=state)
-            stats["errors"].append(f"{state}: no contact in DB")
-            continue
+            # Chicken-and-egg breaker for states we have never sent
+            # messages for (AR/CA/NY at the time of writing): seed a
+            # contact by adding the first viable candidate from that
+            # state, then use them for the stamp purchase. The same
+            # candidate's outreach record is reused later in
+            # send_outreach so we don't double-add.
+            log.info(
+                "No historical contact for state; attempting to seed one",
+                state=state,
+            )
+            contact_name = await _seed_contact_for_state(
+                client=client, state=state, candidates=candidates,
+            )
+            if not contact_name:
+                log.warning(
+                    "Could not seed contact for state, skipping stamp buy",
+                    state=state,
+                )
+                stats["errors"].append(f"{state}: no contact and seed failed")
+                continue
 
         # Packages are chosen by purchase_stamps() from the live page so we
         # get the real sizes (6/20/35/60 vs CDCR's 500/1000/2000/5000).
@@ -605,6 +621,103 @@ async def _get_contact_name_for_state(state: str) -> str | None:
 
     first, last = _split_inmate_name(inmate.name)
     return f"{first} {last}".upper().strip()
+
+
+async def _seed_contact_for_state(
+    client: SecurusClient,
+    state: str,
+    candidates: list[dict],
+    max_seed_attempts: int = 5,
+) -> str | None:
+    """Add a candidate from ``state`` as a Securus contact so the stamp
+    purchase page has someone to associate the buy with.
+
+    Securus' stamp purchase form requires selecting an existing contact
+    to determine the facility/pricing. States with no historical
+    CONTACT_ADDED or MESSAGE_SENT records (AR/CA/NY at the time of
+    writing) get stuck in a chicken-and-egg: we need a contact to buy
+    stamps, and we need stamps to send messages, but we never message
+    until we have stamps. This seeder breaks the loop by adding the
+    first viable candidate from the state up to ``max_seed_attempts``
+    tries. The added candidate's outreach record is marked
+    ``CONTACT_ADDED`` so ``send_outreach`` later skips straight to the
+    message send.
+
+    Returns the Securus-style ``"FIRST LAST"`` contact name on success,
+    or ``None`` if no candidate from ``state`` could be added. Uses
+    only candidates already in the in-memory pool so we don't pull a
+    second DB-wide query.
+    """
+    state_candidates = [c for c in candidates if c["state"] == state]
+    if not state_candidates:
+        log.warning(
+            "Cannot seed contact for state: no candidates in pool",
+            state=state,
+        )
+        return None
+
+    log.info(
+        "Seeding stamp-purchase contact for state",
+        state=state,
+        attempts_allowed=min(max_seed_attempts, len(state_candidates)),
+    )
+
+    for candidate in state_candidates[:max_seed_attempts]:
+        # Skip ones already past contact-added; the lookup above would
+        # have caught them but be defensive.
+        if candidate["outreach_status"] == OutreachStatus.CONTACT_ADDED.value:
+            return f"{candidate['first_name']} {candidate['last_name']}".upper().strip()
+
+        try:
+            result = await client.add_contact(
+                first_name=candidate["first_name"],
+                last_name=candidate["last_name"],
+                state=candidate["state_full"],
+                facility=candidate["agency"],
+                inmate_id=candidate["inmate_id"],
+            )
+        except Exception as e:
+            log.warning(
+                "Seed add_contact crashed, trying next candidate",
+                state=state, name=candidate["name"], error=str(e),
+            )
+            continue
+
+        if result.success:
+            await _mark_contact_added(candidate["outreach_id"])
+            contact_name = (
+                f"{candidate['first_name']} {candidate['last_name']}"
+                .upper().strip()
+            )
+            log.info(
+                "Seeded contact for state",
+                state=state, contact_name=contact_name,
+                inmate_id=candidate["inmate_id"],
+            )
+            return contact_name
+
+        err = (result.error or "").lower()
+        # Failure path: log and persist the failure so we don't keep
+        # trying this candidate, then move on.
+        permanent = _is_permanent_failure(
+            err, candidate.get("discovered_at"))
+        log.info(
+            "Seed add_contact failed, trying next candidate",
+            state=state, name=candidate["name"],
+            error=result.error, permanent=permanent,
+        )
+        if permanent:
+            await _mark_permanently_failed(
+                candidate["outreach_id"], f"add_contact: {result.error}")
+        else:
+            await _mark_failed(
+                candidate["outreach_id"], f"add_contact: {result.error}")
+
+    log.warning(
+        "Could not seed any contact for state after attempts",
+        state=state, tried=min(max_seed_attempts, len(state_candidates)),
+    )
+    return None
 
 
 # =========================================================================
