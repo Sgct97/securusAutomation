@@ -68,11 +68,44 @@ TRANSIENT_NOT_FOUND_MARKERS = [
 ]
 
 
-def _is_permanent_failure(error: str, inmate_discovered_at: Optional[datetime] = None) -> bool:
-    """Decide whether an error is permanent (never retry)."""
+def _is_permanent_failure(
+    error: str,
+    inmate_discovered_at: Optional[datetime] = None,
+    state: Optional[str] = None,
+) -> bool:
+    """Decide whether an error is permanent (never retry).
+
+    For OK we treat the exact Securus "Contact not found on Securus
+    (service may not be available)" answer as terminal on first hit,
+    because the OK pipeline is fed by a static bulk DOC file
+    (Vendor_Profile_Extract_Text.dat) that is a strict superset of who
+    Securus has set up for eMessaging. Manual verification confirmed
+    that specific inmates returning this error are genuinely not on
+    Securus, even when the ID format and agency are correct. Retrying
+    them every day for 30 days wastes ~2 minutes per attempt without
+    any chance of success.
+
+    Crucially this only triggers for the exact Securus-popup error
+    string — not for timeouts, logouts, or any other transient failure
+    mode, which take different code paths and produce different
+    strings (e.g. "Locator.click: Timeout..."). We never want to mark
+    a candidate terminal just because the browser died.
+    """
     err_lower = error.lower()
 
     if any(marker in err_lower for marker in TRULY_PERMANENT_MARKERS):
+        return True
+
+    # OK-specific fast-fail: the bulk file is a superset of Securus's
+    # eMessaging roster, so a clear "not found" answer for OK won't
+    # change on retry. The match is on the exact Securus popup text,
+    # not the broader transient markers list, so timeouts and other
+    # non-popup failures still fall through to the standard retry path.
+    # Accept both the 2-letter code and the full state name so callers
+    # don't have to normalize first.
+    OK_NOT_FOUND_TERMINAL = "contact not found on securus (service may not be available)"
+    state_norm = (state or "").upper()
+    if state_norm in ("OK", "OKLAHOMA") and OK_NOT_FOUND_TERMINAL in err_lower:
         return True
 
     # "Contact not found" is only permanent if the inmate has been in our DB
@@ -700,7 +733,8 @@ async def _seed_contact_for_state(
         # Failure path: log and persist the failure so we don't keep
         # trying this candidate, then move on.
         permanent = _is_permanent_failure(
-            err, candidate.get("discovered_at"))
+            err, candidate.get("discovered_at"),
+            state=candidate.get("state"))
         log.info(
             "Seed add_contact failed, trying next candidate",
             state=state, name=candidate["name"],
@@ -849,7 +883,8 @@ async def send_outreach(
                     err = contact_result.error or "Unknown error"
                     if "already" not in err.lower():
                         permanent = _is_permanent_failure(
-                            err, candidate.get("discovered_at"))
+                            err, candidate.get("discovered_at"),
+                            state=candidate.get("state"))
                         log.warning("Failed to add contact, trying next",
                                     name=candidate["name"], error=err,
                                     permanent=permanent)
@@ -928,7 +963,8 @@ async def send_outreach(
                     stats["failed"] += 1
                     break
                 permanent = _is_permanent_failure(
-                    err, candidate.get("discovered_at"))
+                    err, candidate.get("discovered_at"),
+                    state=candidate.get("state"))
                 if permanent:
                     await _mark_permanently_failed(
                         candidate["outreach_id"], f"send: {err}")
