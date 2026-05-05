@@ -157,7 +157,16 @@ def _split_inmate_name(full_name: str) -> tuple[str, str]:
 
     if "," in full_name:
         last_part, _, rest = full_name.partition(",")
-        last_name = last_part.strip()
+        # The pre-comma portion can contain a generational suffix
+        # ("CANTU III, DAVID M" -> last_name should be "CANTU", not
+        # "CANTU III"). Securus stores the contact label without the
+        # suffix, so leaving it attached makes the dropdown lookup in
+        # _send_message_once fail. Strip trailing suffix tokens here.
+        last_tokens = last_part.strip().split()
+        while len(last_tokens) > 1 and \
+                last_tokens[-1].upper().rstrip(".") in _NAME_SUFFIXES:
+            last_tokens.pop()
+        last_name = " ".join(last_tokens)
         rest_tokens = rest.strip().split()
         first_name = rest_tokens[0] if rest_tokens else ""
         return first_name, last_name
