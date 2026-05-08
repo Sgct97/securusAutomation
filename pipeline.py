@@ -487,6 +487,24 @@ async def get_pending_candidates(limit: int) -> list[dict]:
                 if added_via_backfill:
                     backfill_stats[state] = added_via_backfill
 
+    # Round-robin interleave across states so the daily send cap is
+    # spread fairly. Without this, send_outreach() processes the pool
+    # in WA→OK→NY→CA→AR order and the first state with a deep fresh
+    # pool monopolizes every slot before later states get a turn (see
+    # 2026-05-07 run: 25/25 sends went to WA while NY/CA/AR/OK were
+    # never attempted). Permanent failures still don't burn the cap,
+    # and out_of_stamps_states still skips a state's remaining slots.
+    by_state_lists: dict[str, list[dict]] = {s: [] for s in states}
+    for c in candidates:
+        by_state_lists.setdefault(c["state"], []).append(c)
+
+    interleaved: list[dict] = []
+    while any(by_state_lists[s] for s in states):
+        for s in states:
+            if by_state_lists[s]:
+                interleaved.append(by_state_lists[s].pop(0))
+    candidates = interleaved
+
     log.info("Candidate pool loaded",
              pool_size=len(candidates), send_target=limit,
              induction_lag_days=settings.induction_lag_days,
